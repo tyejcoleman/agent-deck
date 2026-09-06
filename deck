@@ -1,0 +1,719 @@
+#!/usr/bin/env python3
+"""deck - Agent Deck reference CLI.
+
+The files are the protocol (SPEC.md); this script only saves keystrokes.
+Zero dependencies. Python 3.8+. Copy it anywhere on PATH.
+"""
+import argparse
+import contextlib
+import datetime as dt
+import io
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+VERSION = "0.1.0"
+COSTS = ("low", "mid", "high")
+# vendor: (command template, model flag, default cost). Templates are a starting point; edit hands/<id>.json freely.
+VENDORS = {
+    "claude": ("claude -p --permission-mode acceptEdits --output-format json{model} {prompt}", "--model", "high"),
+    "codex": ("codex exec --full-auto --json{model} {prompt}", "-m", "mid"),
+    "cursor": ("cursor-agent -p --force --output-format json{model} {prompt}", "--model", "mid"),
+}
+USAGE_RE = {"tokens_in": r'"input_tokens":\s*(\d+)', "tokens_out": r'"output_tokens":\s*(\d+)', "cost_usd": r'"total_cost_usd":\s*([\d.]+)'}
+RATE_LIMIT_RE = r"(?i)rate.?limit|usage limit|hit your limit|quota exceeded|too many requests|\b429\b"
+FINAL = {"END": "done", "BLOCKED": "blocked", "FAILED": "failed"}
+
+PROMPT = """You are a worker hand on an Agent Deck. Task {id}: {title}
+Work in the current directory and do what CONTEXT describes.
+When finished or blocked, write a handoff file at: {handoff}
+Use exactly these headings: "## Status" (END or BLOCKED), "## What changed", "## Open questions", "## Next step". Then stop.
+
+--- CONTEXT ---
+{context}
+"""
+CONTEXT_MD = "# {title}\n\n## Goal\n\n## Constraints\n\n## Files / repo\n\n## Done when\n"
+HANDOFF_MD = "## Status\n{status}\n\n## What changed\n{body}\n\n## Open questions\n\n## Next step\n"
+AGENTS_MD = """# Agent Deck - read me first (any agent landing here)
+
+This folder is the deck: a roster of coding-agent "hands", the accounts they bill to, and the tasks in
+flight. The files are the protocol; the `deck` CLI is a convenience. Full spec: https://github.com/tyejcoleman/agent-deck
+
+- accounts/<id>.json   vendor login pointer + rate window + env (never secrets)
+- hands/<id>.json      worker preset: vendor, account, model, cmd, cost class
+- tasks/<id>/          task.json, CONTEXT.md (what the worker needs), HANDOFF.md (what it left), runs/*.log
+- claims/<hand>.json   who holds a hand right now (expires at `until`)
+- ledger.jsonl         usage per run: units, tokens, seconds, cost
+- events.jsonl         append-only decklog: TASK CLAIM START END BLOCKED FAILED COOLDOWN NOTE
+- hooks.d/             executables named <TYPE>-* or any-* run on each event (wake meta-agents)
+
+META-AGENT (Cos, OpenClaw, Grok bot, human):
+  deck status                    what's free / claimed / exhausted, headroom per account
+  deck task add "title"          then edit tasks/<id>/CONTEXT.md
+  deck run <task> [--hand H]     route -> claim -> run hand -> ledger -> HANDOFF.md -> END|BLOCKED event
+  deck events -f                 wake on END/BLOCKED, read HANDOFF.md, steer the next task
+  deck --json <anything>         machine output
+
+WORKER (Claude Code, Codex, Cursor) started by `deck run`:
+  read $DECK_CONTEXT, do the work, write $DECK_HANDOFF with headings
+  "## Status" (END|BLOCKED) "## What changed" "## Open questions" "## Next step", then exit.
+  Manual close: deck handoff <task> --status END --text "..."
+
+Rules: files first. Never store secrets here. Cut anything nobody reads.
+"""
+
+
+# ---------- helpers ----------
+def die(msg):
+    raise SystemExit("deck: %s" % msg)
+
+
+def now():
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+
+
+def iso(t):
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def ts(s):
+    return dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+
+
+def dur(s):
+    m = re.fullmatch(r"(\d+)\s*([smhdw])", str(s).strip())
+    if not m:
+        die("bad duration %r (use 30m, 5h, 2d, 1w)" % s)
+    return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[m.group(2)]
+
+
+def fdur(sec):
+    sec = int(max(sec, 0))
+    if sec >= 86400:
+        return "%dd%dh" % (sec // 86400, sec % 86400 // 3600)
+    if sec >= 3600:
+        return "%dh%02dm" % (sec // 3600, sec % 3600 // 60)
+    return "%dm%02ds" % (sec // 60, sec % 60)
+
+
+def who(a):
+    return getattr(a, "by", None) or os.environ.get("DECK_AGENT") or "deck"
+
+
+def out(a, data, text=None):
+    print(json.dumps(data, indent=2) if a.json or text is None else text)
+
+
+def table(head, rows):
+    rows = [[str(c) for c in r] for r in rows]
+    w = [max(len(x) for x in col) for col in zip(head, *rows)]
+    return "\n".join("  ".join(x.ljust(n) for x, n in zip(r, w)).rstrip() for r in [head] + rows)
+
+
+def read_text_arg(a):
+    if getattr(a, "text", None):
+        return a.text
+    f = getattr(a, "file", None)
+    if f == "-":
+        return sys.stdin.read()
+    return Path(f).read_text() if f else None
+
+
+def parse_status(text):
+    m = re.search(r"(?i)status[^A-Za-z]*(END|BLOCKED|FAILED)\b", text or "")
+    return m.group(1).upper() if m else "END"
+
+
+def result_text(output, lines=40):
+    try:
+        obj = json.loads(output)
+        if isinstance(obj, dict) and isinstance(obj.get("result"), str):
+            return obj["result"]
+    except ValueError:
+        pass
+    return "\n".join(output.strip().splitlines()[-lines:])
+
+
+# ---------- deck ----------
+class Deck:
+    def __init__(self, root):
+        self.root = Path(root).resolve()
+
+    @classmethod
+    def find(cls):
+        if os.environ.get("DECK_ROOT"):
+            return cls(os.environ["DECK_ROOT"])
+        d = Path.cwd()
+        for p in [d] + list(d.parents):
+            if (p / ".deck" / "deck.json").exists():
+                return cls(p / ".deck")
+        die("no .deck/ here or above (run `deck init`, or set DECK_ROOT)")
+
+    def p(self, *parts):
+        return self.root.joinpath(*parts)
+
+    def load(self, *parts):
+        f = self.p(*parts)
+        if not f.exists():
+            die("not found: %s" % f.relative_to(self.root))
+        return json.loads(f.read_text())
+
+    def save(self, obj, *parts):
+        f = self.p(*parts)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_suffix(".tmp")
+        tmp.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp, f)
+
+    def items(self, kind):
+        pat = "*/task.json" if kind == "tasks" else "*.json"
+        return sorted((json.loads(f.read_text()) for f in self.p(kind).glob(pat)), key=lambda o: o["id"])
+
+    def rows(self, name):
+        f = self.p(name)
+        return [json.loads(l) for l in f.read_text().splitlines() if l.strip()] if f.exists() else []
+
+    def append(self, name, row):
+        with open(str(self.p(name)), "a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+
+def emit(deck, type_, **kw):
+    ev = {"ts": iso(now()), "type": type_}
+    ev.update({k: v for k, v in kw.items() if v not in (None, "")})
+    deck.append("events.jsonl", ev)
+    hooks = deck.p("hooks.d")
+    for h in sorted(hooks.iterdir()) if hooks.is_dir() else []:
+        if not (h.is_file() and os.access(str(h), os.X_OK) and re.match(r"(%s|any)([-._]|$)" % re.escape(type_), h.name)):
+            continue
+        env = dict(os.environ, DECK_ROOT=str(deck.root), DECK_EVENT=json.dumps(ev), DECK_EVENT_TYPE=type_,
+                   DECK_TASK=str(ev.get("task", "")), DECK_HAND=str(ev.get("hand", "")))
+        try:
+            subprocess.run([str(h)], input=json.dumps(ev), text=True, env=env, timeout=60, cwd=str(deck.root.parent))
+        except Exception as e:  # hooks must never break the deck
+            print("deck: hook %s failed: %s" % (h.name, e), file=sys.stderr)
+    return ev
+
+
+def headroom(acct, ledger):
+    t, win, metric = now(), dur(acct.get("window", "5h")), acct.get("metric", "runs")
+    rows = [r for r in ledger if r.get("account") == acct["id"] and (t - ts(r["ts"])).total_seconds() < win]
+    used = sum((r.get("units", 1) if metric == "runs" else (r.get("tokens_in") or 0) + (r.get("tokens_out") or 0)) for r in rows)
+    limit, cool = acct.get("limit"), acct.get("cooldown_until")
+    state = "cooldown" if cool and ts(cool) > t else "exhausted" if limit and used >= limit else "ok"
+    return {"account": acct["id"], "metric": metric, "used": used, "limit": limit,
+            "left": (limit - used) if limit else None, "frac": max(0.0, 1 - used / limit) if limit else 1.0,
+            "reset_at": iso(ts(min(r["ts"] for r in rows)) + dt.timedelta(seconds=win)) if rows else None,
+            "cooldown_until": cool if state == "cooldown" else None, "state": state}
+
+
+def claim_of(deck, hand):
+    f = deck.p("claims", hand + ".json")
+    if not f.exists():
+        return None
+    c = json.loads(f.read_text())
+    return c if not c.get("until") or ts(c["until"]) > now() else None
+
+
+def roster(deck):
+    ledger = deck.rows("ledger.jsonl")
+    hr = {a["id"]: headroom(a, ledger) for a in deck.items("accounts")}
+    last = {r.get("hand"): r["ts"] for r in ledger}
+    res = []
+    for h in deck.items("hands"):
+        c, a = claim_of(deck, h["id"]), hr.get(h.get("account"))
+        state = "claimed" if c else "no-account" if not a else "free" if a["state"] == "ok" else a["state"]
+        res.append(dict(h, state=state, claim=c, headroom=a, last_used=last.get(h["id"])))
+    return res
+
+
+def route(deck, cost=None, vendor=None):
+    order = {c: i for i, c in enumerate(COSTS)}
+    cands = [h for h in roster(deck) if h["state"] == "free" and (not vendor or h.get("vendor") == vendor)]
+    cands.sort(key=lambda h: (abs(order.get(h.get("cost", "mid"), 1) - order.get(cost, 1)) if cost else 0,
+                              -h["headroom"]["frac"], h.get("last_used") or ""))
+    return cands
+
+
+def do_claim(deck, hand, task, by, ttl):
+    c = claim_of(deck, hand)
+    if c:
+        die("hand %s is claimed by %s (task %s) until %s" % (hand, c["by"], c.get("task"), c.get("until")))
+    f = deck.p("claims", hand + ".json")
+    if f.exists():
+        f.unlink()
+    rec = {"hand": hand, "task": task, "by": by, "since": iso(now()), "until": iso(now() + dt.timedelta(seconds=dur(ttl)))}
+    try:
+        fd = os.open(str(f), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    except FileExistsError:
+        die("hand %s was just claimed by someone else" % hand)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(rec, fh, indent=2)
+    emit(deck, "CLAIM", hand=hand, task=task, by=by)
+    return rec
+
+
+def do_release(deck, hand, by, task=None):
+    f = deck.p("claims", hand + ".json")
+    if f.exists():
+        f.unlink()
+        emit(deck, "RELEASE", hand=hand, task=task, by=by)
+
+
+def finish(deck, task, status, by, **ev):
+    task["status"] = FINAL[status]
+    task["finished"] = iso(now())
+    deck.save(task, "tasks", task["id"], "task.json")
+    c = claim_of(deck, task["hand"]) if task.get("hand") else None
+    if c and c.get("task") == task["id"]:
+        do_release(deck, task["hand"], by, task["id"])
+    return emit(deck, status, task=task["id"], hand=task.get("hand"), by=by, **ev)
+
+
+# ---------- commands ----------
+def cmd_init(a):
+    root = Path(a.path or ".").resolve() / ".deck"
+    for d in ("accounts", "hands", "tasks", "claims", "hooks.d"):
+        (root / d).mkdir(parents=True, exist_ok=True)
+    if not (root / "deck.json").exists():
+        Deck(root).save({"version": 1, "name": a.name or root.parent.name}, "deck.json")
+    for f in ("events.jsonl", "ledger.jsonl"):
+        (root / f).touch()
+    (root / "AGENTS.md").write_text(AGENTS_MD)
+    out(a, {"deck": str(root)}, "deck ready: %s\nnext: deck account add <id> --vendor claude|codex|cursor\n      deck hand add <id> --account <id> [--model M]" % root)
+
+
+def cmd_account(deck, a):
+    if a.sub == "add":
+        f = deck.p("accounts", a.id + ".json")
+        rec = dict(json.loads(f.read_text()) if f.exists() else {}, id=a.id)
+        for k in ("vendor", "login", "window", "metric", "notes"):
+            if getattr(a, k) is not None:
+                rec[k] = getattr(a, k)
+        if a.limit is not None:
+            rec["limit"] = a.limit or None
+        if a.env:
+            rec["env"] = dict(rec.get("env", {}), **dict(kv.split("=", 1) for kv in a.env))
+        for k, v in (("vendor", "custom"), ("window", "5h"), ("metric", "runs")):
+            rec.setdefault(k, v)
+        dur(rec["window"])  # validate
+        deck.save(rec, "accounts", a.id + ".json")
+        emit(deck, "ACCOUNT", account=a.id, by=who(a))
+        return out(a, rec, "account %s saved (%s, %s %s per %s)" % (a.id, rec["vendor"], rec.get("limit") or "unlimited", rec["metric"], rec["window"]))
+    if a.sub == "rm":
+        deck.p("accounts", a.id + ".json").unlink()
+        return out(a, {"removed": a.id}, "removed account %s" % a.id)
+    if a.sub == "cooldown":
+        rec = deck.load("accounts", a.id + ".json")
+        rec["cooldown_until"] = None if a.clear else a.until or iso(now() + dt.timedelta(seconds=dur(a.for_ or "1h")))
+        deck.save(rec, "accounts", a.id + ".json")
+        emit(deck, "COOLDOWN", account=a.id, until=rec["cooldown_until"], by=who(a))
+        return out(a, rec, "account %s cooldown until %s" % (a.id, rec["cooldown_until"]))
+    ledger = deck.rows("ledger.jsonl")
+    rows = [dict(x, headroom=headroom(x, ledger)) for x in deck.items("accounts")]
+    out(a, rows, table(["ACCOUNT", "VENDOR", "STATE", "USED", "LIMIT", "WINDOW", "RESET", "LOGIN"],
+                       [[r["id"], r.get("vendor", ""), r["headroom"]["state"], r["headroom"]["used"], r.get("limit") or "-",
+                         r.get("window"), r["headroom"]["reset_at"] or "-", r.get("login", "")] for r in rows]) if rows else "no accounts")
+
+
+def cmd_hand(deck, a):
+    if a.sub == "add":
+        f = deck.p("hands", a.id + ".json")
+        rec = dict(json.loads(f.read_text()) if f.exists() else {}, id=a.id)
+        acct = deck.load("accounts", (a.account or rec.get("account") or die("--account required")) + ".json")
+        rec["account"], rec["vendor"] = acct["id"], a.vendor or rec.get("vendor") or acct.get("vendor")
+        for k in ("model", "cost", "cmd", "notes"):
+            if getattr(a, k):
+                rec[k] = getattr(a, k)
+        if "cmd" not in rec:
+            if rec["vendor"] not in VENDORS:
+                die("--cmd required for vendor %r (built-in templates: %s)" % (rec["vendor"], ", ".join(VENDORS)))
+            tpl, flag, cost = VENDORS[rec["vendor"]]
+            rec["cmd"] = tpl.format(model=" %s %s" % (flag, shlex.quote(rec["model"])) if rec.get("model") else "", prompt="{prompt}")
+            rec.setdefault("cost", cost)
+        rec.setdefault("cost", "mid")
+        deck.save(rec, "hands", a.id + ".json")
+        emit(deck, "HAND", hand=a.id, account=acct["id"], by=who(a))
+        return out(a, rec, "hand %s saved -> %s\n  cmd: %s" % (a.id, acct["id"], rec["cmd"]))
+    if a.sub == "rm":
+        deck.p("hands", a.id + ".json").unlink()
+        return out(a, {"removed": a.id}, "removed hand %s" % a.id)
+    rows = roster(deck)
+    out(a, rows, table(["HAND", "VENDOR", "ACCOUNT", "MODEL", "COST", "STATE"],
+                       [[h["id"], h.get("vendor", ""), h.get("account", ""), h.get("model", "-"), h.get("cost", ""), h["state"]] for h in rows]) if rows else "no hands")
+
+
+def cmd_status(deck, a):
+    ro, counts = roster(deck), {}
+    for t in deck.items("tasks"):
+        counts[t["status"]] = counts.get(t["status"], 0) + 1
+    if a.json:
+        return out(a, {"deck": str(deck.root), "hands": ro, "tasks": counts})
+    rows = []
+    for h in ro:
+        hr, c = h["headroom"] or {}, h["claim"]
+        head = "-" if not hr else "%s/%s %s" % (hr["used"], hr["limit"], hr["metric"]) if hr.get("limit") else "%s %s" % (hr["used"], hr["metric"])
+        note = ("by %s on %s" % (c["by"], c.get("task", "?")) if c else
+                "until %s" % hr["cooldown_until"] if h["state"] == "cooldown" else
+                "resets in %s" % fdur((ts(hr["reset_at"]) - now()).total_seconds()) if hr.get("reset_at") else "")
+        rows.append([h["id"], h.get("account", ""), h.get("cost", ""), h["state"], head, note])
+    print(table(["HAND", "ACCOUNT", "COST", "STATE", "HEADROOM", "NOTE"], rows) if rows else "no hands (deck hand add ...)")
+    print("tasks: " + (", ".join("%s %d" % kv for kv in sorted(counts.items())) or "none"))
+
+
+def cmd_route(deck, a):
+    ranked = route(deck, a.cost, a.vendor)
+    out(a, ranked, table(["#", "HAND", "COST", "HEADROOM", "LAST USED"],
+                         [[i + 1, h["id"], h.get("cost", ""), "%d%%" % round(h["headroom"]["frac"] * 100), h.get("last_used") or "never"]
+                          for i, h in enumerate(ranked)]) if ranked else "no free hand")
+    return 0 if ranked else 2
+
+
+def cmd_task(deck, a):
+    if a.sub == "add":
+        tid = a.id or "t-%s-%s" % (now().strftime("%m%d"), uuid.uuid4().hex[:4])
+        if deck.p("tasks", tid, "task.json").exists():
+            die("task exists: %s" % tid)
+        rec = {"id": tid, "title": a.title, "status": "open", "created": iso(now()), "runs": 0}
+        if a.cost:
+            rec["cost"] = a.cost
+        if a.cwd:
+            rec["cwd"] = str(Path(a.cwd).resolve())
+        deck.save(rec, "tasks", tid, "task.json")
+        deck.p("tasks", tid, "CONTEXT.md").write_text(read_text_arg(a) or CONTEXT_MD.format(title=a.title))
+        emit(deck, "TASK", task=tid, by=who(a), msg=a.title)
+        return out(a, rec, tid)
+    if a.sub == "show":
+        t = deck.load("tasks", a.id, "task.json")
+        ctx, hf = (deck.p("tasks", a.id, n) for n in ("CONTEXT.md", "HANDOFF.md"))
+        t["context"], t["handoff"] = (f.read_text() if f.exists() else None for f in (ctx, hf))
+        return out(a, t, "%s\n\n--- CONTEXT.md ---\n%s\n--- HANDOFF.md ---\n%s" % (json.dumps({k: v for k, v in t.items() if k not in ("context", "handoff")}, indent=2), t["context"] or "", t["handoff"] or "(none)"))
+    if a.sub == "set":
+        t = deck.load("tasks", a.id, "task.json")
+        for kv in a.kv:
+            k, v = kv.split("=", 1)
+            try:
+                t[k] = json.loads(v)
+            except ValueError:
+                t[k] = v
+        deck.save(t, "tasks", a.id, "task.json")
+        return out(a, t, "updated %s" % a.id)
+    rows = [t for t in deck.items("tasks") if not a.status or t["status"] in a.status.split(",")]
+    out(a, rows, table(["TASK", "STATUS", "HAND", "RUNS", "TITLE"], [[t["id"], t["status"], t.get("hand") or "-", t.get("runs", 0), t["title"]] for t in rows]) if rows else "no tasks")
+
+
+def cmd_claim(deck, a):
+    deck.load("hands", a.hand + ".json")
+    out(a, do_claim(deck, a.hand, a.task, who(a), a.ttl), "claimed %s until %s" % (a.hand, "+" + a.ttl))
+
+
+def cmd_release(deck, a):
+    do_release(deck, a.hand, who(a))
+    out(a, {"released": a.hand}, "released %s" % a.hand)
+
+
+def cmd_run(deck, a):
+    task = deck.load("tasks", a.task, "task.json")
+    if task["status"] == "running" and not a.force:
+        die("task %s is already running (use --force)" % a.task)
+    by = who(a)
+    if a.hand:
+        hand = deck.load("hands", a.hand + ".json")
+    else:
+        ranked = route(deck, a.cost or task.get("cost"), a.vendor)
+        if not ranked:
+            resets = [h["headroom"].get("cooldown_until") or h["headroom"].get("reset_at") for h in roster(deck) if h["headroom"]]
+            msg = "no free hand" + ("; earliest reset %s" % min(r for r in resets if r) if any(resets) else "")
+            task.pop("hand", None)
+            finish(deck, task, "BLOCKED", by, msg=msg)
+            out(a, {"status": "BLOCKED", "msg": msg}, "BLOCKED: " + msg)
+            return 2
+        hand = ranked[0]
+    acct = deck.load("accounts", hand["account"] + ".json")
+    tdir = deck.p("tasks", task["id"])
+    ctx, hf = tdir / "CONTEXT.md", tdir / "HANDOFF.md"
+    prompt = PROMPT.format(id=task["id"], title=task["title"], handoff=hf, context=ctx.read_text() if ctx.exists() else task["title"])
+    cmd = hand["cmd"].replace("{context}", shlex.quote(str(ctx))).replace("{handoff}", shlex.quote(str(hf))).replace("{task}", task["id"])
+    stdin = None if "{prompt}" in cmd else prompt
+    cmd = cmd.replace("{prompt}", shlex.quote(prompt))
+    cwd = a.cwd or task.get("cwd") or str(deck.root.parent)
+    if a.dry:
+        return out(a, {"hand": hand["id"], "cwd": cwd, "cmd": cmd, "stdin": stdin}, "hand: %s\ncwd:  %s\ncmd:  %s%s" % (hand["id"], cwd, cmd, "\n--- stdin ---\n" + stdin if stdin else ""))
+    do_claim(deck, hand["id"], task["id"], by, a.ttl)
+    task.update(status="running", hand=hand["id"], runs=task.get("runs", 0) + 1)
+    deck.save(task, "tasks", task["id"], "task.json")
+    n = task["runs"]
+    emit(deck, "START", task=task["id"], hand=hand["id"], by=by, run=n)
+    env = dict(os.environ, **{k: os.path.expanduser(str(v)) for k, v in acct.get("env", {}).items()})
+    env.update(DECK_ROOT=str(deck.root), DECK_TASK=task["id"], DECK_HAND=hand["id"], DECK_CONTEXT=str(ctx), DECK_HANDOFF=str(hf))
+    before, t0, msg = hf.stat().st_mtime if hf.exists() else 0, time.time(), None
+    try:
+        p = subprocess.run(cmd, shell=True, cwd=cwd, input=stdin, capture_output=True, text=True, env=env,
+                           timeout=dur(a.timeout) if a.timeout else None)
+        output, code = (p.stdout or "") + (p.stderr or ""), p.returncode
+    except subprocess.TimeoutExpired as e:
+        output, code = (e.stdout or "") + (e.stderr or "") + "\n[deck] timeout after %s" % a.timeout, 124
+        msg = "timeout after %s" % a.timeout
+    secs = round(time.time() - t0)
+    (tdir / "runs").mkdir(exist_ok=True)
+    (tdir / "runs" / ("%d.log" % n)).write_text(output)
+    usage = {k: (float if k == "cost_usd" else int)(sum(float(x) for x in re.findall(rx, output))) for k, rx in USAGE_RE.items()}
+    usage = {k: v for k, v in usage.items() if v}
+    wrote = hf.exists() and hf.stat().st_mtime > before
+    if wrote:
+        status = parse_status(hf.read_text())
+    elif code == 0:
+        status = "END"
+    elif re.search(RATE_LIMIT_RE, output):
+        status, msg = "BLOCKED", "rate limited on account %s" % acct["id"]
+        acct["cooldown_until"] = iso(now() + dt.timedelta(seconds=dur(acct.get("cooldown", "1h"))))
+        deck.save(acct, "accounts", acct["id"] + ".json")
+        emit(deck, "COOLDOWN", account=acct["id"], until=acct["cooldown_until"], by=by, msg=msg)
+    else:
+        status, msg = "FAILED", msg or "exit %d" % code
+    if not wrote:
+        hf.write_text(HANDOFF_MD.format(status="%s (auto: worker exited %d without writing a handoff)" % (status, code),
+                                        body="Output tail:\n\n```\n%s\n```" % result_text(output)))
+    deck.append("ledger.jsonl", dict({"ts": iso(now()), "account": acct["id"], "hand": hand["id"], "task": task["id"], "run": n,
+                                      "units": 1, "seconds": secs, "exit": code}, **usage))
+    ev = finish(deck, task, status, by, run=n, seconds=secs, exit=code, msg=msg, **usage)
+    out(a, dict(ev, handoff=str(hf), log=str(tdir / "runs" / ("%d.log" % n))),
+        "%s %s on %s (%s, exit %d%s)\nhandoff: %s" % (status, task["id"], hand["id"], fdur(secs), code, "; " + msg if msg else "", hf))
+    return {"END": 0, "BLOCKED": 2, "FAILED": 1}[status]
+
+
+def cmd_handoff(deck, a):
+    task = deck.load("tasks", a.task, "task.json")
+    hf = deck.p("tasks", a.task, "HANDOFF.md")
+    text = read_text_arg(a)
+    if a.text:
+        text = HANDOFF_MD.format(status=a.status or "END", body=a.text)
+    if text:
+        hf.write_text(text)
+    if not hf.exists():
+        die("no HANDOFF.md for %s; pass --text or --file" % a.task)
+    status = a.status or parse_status(hf.read_text())
+    ev = finish(deck, task, status, who(a), msg=a.text and a.text[:200])
+    out(a, ev, "%s %s" % (status, a.task))
+
+
+def cmd_usage(deck, a):
+    deck.load("accounts", a.account + ".json")
+    row = {"ts": iso(now()), "account": a.account, "hand": a.hand, "task": a.task, "units": a.units,
+           "tokens_in": a.tokens_in, "tokens_out": a.tokens_out, "cost_usd": a.cost_usd, "by": who(a)}
+    row = {k: v for k, v in row.items() if v is not None}
+    deck.append("ledger.jsonl", row)
+    out(a, row, "recorded usage on %s" % a.account)
+
+
+def cmd_ledger(deck, a):
+    since = now() - dt.timedelta(seconds=dur(a.since)) if a.since else None
+    rows = [r for r in deck.rows("ledger.jsonl") if (not a.account or r.get("account") == a.account) and (not since or ts(r["ts"]) >= since)]
+    tot = {}
+    for r in rows:
+        t = tot.setdefault(r.get("account", "?"), {"account": r.get("account", "?"), "runs": 0, "units": 0, "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "seconds": 0})
+        t["runs"] += 1
+        for k in ("units", "tokens_in", "tokens_out", "cost_usd", "seconds"):
+            t[k] += r.get(k) or 0
+    out(a, {"rows": rows, "totals": list(tot.values())},
+        table(["ACCOUNT", "RUNS", "UNITS", "TOKENS IN", "TOKENS OUT", "COST USD", "TIME"],
+              [[t["account"], t["runs"], t["units"], t["tokens_in"], t["tokens_out"], "%.4f" % t["cost_usd"], fdur(t["seconds"])] for t in tot.values()]) if tot else "ledger empty")
+
+
+def cmd_events(deck, a):
+    since = now() - dt.timedelta(seconds=dur(a.since)) if a.since else None
+    types = set(a.type.upper().split(",")) if a.type else None
+
+    def fmt(e):
+        return json.dumps(e) if a.json else "%s %-8s %s" % (e["ts"], e["type"], " ".join("%s=%s" % kv for kv in e.items() if kv[0] not in ("ts", "type")))
+
+    def ok(e):
+        return (not since or ts(e["ts"]) >= since) and (not types or e["type"] in types)
+
+    f = deck.p("events.jsonl")
+    for e in [e for e in deck.rows("events.jsonl") if ok(e)][-a.n:]:
+        print(fmt(e), flush=True)
+    if not a.follow:
+        return
+    with open(str(f)) as fh:
+        fh.seek(0, 2)
+        while True:
+            line = fh.readline()
+            if not line:
+                time.sleep(0.5)
+                continue
+            if line.strip():
+                e = json.loads(line)
+                if ok(e):
+                    print(fmt(e), flush=True)
+
+
+def cmd_event(deck, a):
+    out(a, emit(deck, a.type.upper(), task=a.task, hand=a.hand, by=who(a), msg=a.msg), "emitted %s" % a.type.upper())
+
+
+# ---------- MCP (stdio) ----------
+# name, description, base argv, {param: flag or None for positional}, required params
+MCP_TOOLS = [
+    ("deck_status", "Roster: every hand with state (free/claimed/exhausted/cooldown), account headroom, task counts.", ["status"], {}, []),
+    ("deck_route", "Rank free hands for a task. cost: low|mid|high preference; vendor: claude|codex|cursor.", ["route"], {"cost": "--cost", "vendor": "--vendor"}, []),
+    ("deck_task_add", "Create a task. title required; context = CONTEXT.md body; cost = low|mid|high; cwd = where the worker runs; id optional.", ["task", "add"], {"title": None, "context": "--text", "cost": "--cost", "cwd": "--cwd", "id": "--id"}, ["title"]),
+    ("deck_task_ls", "List tasks, optionally filtered by status (open,running,done,blocked,failed).", ["task", "ls"], {"status": "--status"}, []),
+    ("deck_task_show", "Show a task with its CONTEXT.md and HANDOFF.md.", ["task", "show"], {"id": None}, ["id"]),
+    ("deck_run", "Dispatch a task: route (or use hand), claim, run the worker, record ledger, return END/BLOCKED/FAILED. Blocks until the worker exits. timeout like 30m.", ["run"], {"task": None, "hand": "--hand", "cost": "--cost", "vendor": "--vendor", "timeout": "--timeout", "by": "--by"}, ["task"]),
+    ("deck_handoff", "Close a task manually: write HANDOFF.md text and emit END or BLOCKED.", ["handoff"], {"task": None, "status": "--status", "text": "--text", "by": "--by"}, ["task"]),
+    ("deck_events", "Recent events (decklog). n = count; type = comma list e.g. END,BLOCKED; since like 2h.", ["events"], {"n": "-n", "type": "--type", "since": "--since"}, []),
+    ("deck_ledger", "Usage totals per account (runs, tokens, cost, time). account filter; since like 24h.", ["ledger"], {"account": "--account", "since": "--since"}, []),
+    ("deck_account_add", "Add/update an account. vendor: claude|codex|cursor|custom; login = pointer, never a secret; limit + window (5h) + metric (runs|tokens); env = KEY=VAL for per-account config dirs.", ["account", "add"], {"id": None, "vendor": "--vendor", "login": "--login", "limit": "--limit", "window": "--window", "metric": "--metric", "env": "--env"}, ["id"]),
+    ("deck_account_cooldown", "Mark an account exhausted for a duration (e.g. 2h), or clear=true to lift it.", ["account", "cooldown"], {"id": None, "for": "--for", "clear": "--clear!"}, ["id"]),
+    ("deck_hand_add", "Add/update a hand preset bound to an account. model, cost (low|mid|high), cmd (shell with {prompt}/{context}/{handoff}); cmd defaults from vendor template.", ["hand", "add"], {"id": None, "account": "--account", "vendor": "--vendor", "model": "--model", "cost": "--cost", "cmd": "--cmd"}, ["id"]),
+    ("deck_usage_add", "Record usage on an account by hand (for workers not run via deck run).", ["usage", "add"], {"account": "--account", "hand": "--hand", "task": "--task", "units": "--units", "tokens_in": "--tokens-in", "tokens_out": "--tokens-out", "cost_usd": "--cost-usd"}, ["account"]),
+]
+
+
+def cmd_mcp(_deck, _a):
+    def reply(id_, result=None, error=None):
+        msg = {"jsonrpc": "2.0", "id": id_}
+        msg["error" if error else "result"] = error or result
+        sys.stdout.write(json.dumps(msg) + "\n")
+        sys.stdout.flush()
+
+    tools = [{"name": n, "description": d, "inputSchema": {"type": "object", "properties": {p: {"type": "string"} for p in ps}, "required": req}}
+             for n, d, _, ps, req in MCP_TOOLS]
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        req = json.loads(line)
+        m, id_, params = req.get("method"), req.get("id"), req.get("params") or {}
+        if m == "initialize":
+            reply(id_, {"protocolVersion": params.get("protocolVersion", "2025-06-18"), "capabilities": {"tools": {}}, "serverInfo": {"name": "agent-deck", "version": VERSION}})
+        elif m == "tools/list":
+            reply(id_, {"tools": tools})
+        elif m == "tools/call":
+            spec = next((t for t in MCP_TOOLS if t[0] == params.get("name")), None)
+            if not spec:
+                reply(id_, error={"code": -32602, "message": "unknown tool %s" % params.get("name")})
+                continue
+            pos, flags = [], ["--json"]
+            for k, v in (params.get("arguments") or {}).items():
+                flag = spec[3].get(k, "?")
+                if flag == "?" or v in (None, ""):
+                    continue
+                if flag is None:
+                    pos.append(str(v))
+                elif flag.endswith("!"):  # boolean switch
+                    flags += [flag[:-1]] if str(v).lower() not in ("false", "0", "no") else []
+                else:
+                    flags += [flag, str(v)]
+            buf, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+                try:
+                    code = main(list(spec[2]) + pos + flags) or 0
+                except SystemExit as e:
+                    code = 1
+                    err.write(str(e))
+            reply(id_, {"content": [{"type": "text", "text": (buf.getvalue() + err.getvalue()).strip() or "ok"}], "isError": code not in (0, 2)})
+        elif m == "ping":
+            reply(id_, {})
+        elif id_ is not None:
+            reply(id_, error={"code": -32601, "message": "method not found: %s" % m})
+
+
+# ---------- argparse ----------
+def build_parser():
+    ap = argparse.ArgumentParser(prog="deck", description="Agent Deck: a roster of coding-agent hands, as files.")
+    ap.add_argument("--version", action="version", version="deck " + VERSION)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="machine-readable output")
+    common.add_argument("--by", help="who is acting (default $DECK_AGENT or 'deck')")
+    sub = ap.add_subparsers(dest="cmd", metavar="<command>")
+
+    def sp(name, fn, help_, parent=sub, **kw):
+        p = parent.add_parser(name, help=help_, parents=[common], **kw)
+        p.set_defaults(fn=fn, sub=name if parent is not sub else None)
+        return p
+
+    def group(name, help_):
+        p = sub.add_parser(name, help=help_)
+        p.set_defaults(fn=None, group=p)
+        return p.add_subparsers(dest="sub", metavar="<sub>")
+
+    p = sp("init", cmd_init, "create .deck/ here (idempotent)")
+    p.add_argument("path", nargs="?"), p.add_argument("--name")
+
+    s = group("account", "accounts: add | ls | rm | cooldown")
+    q = sp("add", cmd_account, "add or update an account", s)
+    q.add_argument("id"), q.add_argument("--vendor", help="claude|codex|cursor|custom"), q.add_argument("--login", help="how it's logged in (pointer, never a secret)")
+    q.add_argument("--limit", type=int, help="units per window (0 = unlimited)"), q.add_argument("--window", help="rate window, e.g. 5h (default)"), q.add_argument("--metric", choices=("runs", "tokens"))
+    q.add_argument("--env", action="append", help="KEY=VAL applied when hands on this account run (repeatable)"), q.add_argument("--notes")
+    sp("ls", cmd_account, "list accounts with headroom", s)
+    sp("rm", cmd_account, "remove an account", s).add_argument("id")
+    q = sp("cooldown", cmd_account, "mark exhausted for a while", s)
+    q.add_argument("id"), q.add_argument("--for", dest="for_", help="duration, e.g. 2h (default 1h)"), q.add_argument("--until", help="ISO time"), q.add_argument("--clear", action="store_true")
+
+    s = group("hand", "hands: add | ls | rm")
+    q = sp("add", cmd_hand, "add or update a hand preset", s)
+    q.add_argument("id"), q.add_argument("--account"), q.add_argument("--vendor"), q.add_argument("--model"), q.add_argument("--cost", choices=COSTS)
+    q.add_argument("--cmd", help="shell command; placeholders {prompt} {context} {handoff} {task}"), q.add_argument("--notes")
+    sp("ls", cmd_hand, "list hands", s)
+    sp("rm", cmd_hand, "remove a hand", s).add_argument("id")
+
+    sp("status", cmd_status, "the roster: what's free, claimed, exhausted")
+    p = sp("route", cmd_route, "rank free hands (no side effects)")
+    p.add_argument("--cost", choices=COSTS), p.add_argument("--vendor")
+
+    s = group("task", "tasks: add | ls | show | set")
+    q = sp("add", cmd_task, "create a task + CONTEXT.md", s)
+    q.add_argument("title"), q.add_argument("--id"), q.add_argument("--cost", choices=COSTS), q.add_argument("--cwd", help="where the worker runs")
+    q.add_argument("--file", help="CONTEXT.md from file ('-' = stdin)"), q.add_argument("--text", help="CONTEXT.md body")
+    sp("ls", cmd_task, "list tasks", s).add_argument("--status", help="comma list")
+    sp("show", cmd_task, "task + CONTEXT + HANDOFF", s).add_argument("id")
+    q = sp("set", cmd_task, "set fields: deck task set <id> status=open cost=low", s)
+    q.add_argument("id"), q.add_argument("kv", nargs="+")
+
+    p = sp("claim", cmd_claim, "lease a hand")
+    p.add_argument("hand"), p.add_argument("--task"), p.add_argument("--ttl", default="2h")
+    sp("release", cmd_release, "release a hand").add_argument("hand")
+
+    p = sp("run", cmd_run, "dispatch a task to a hand and wait for it")
+    p.add_argument("task"), p.add_argument("--hand"), p.add_argument("--cost", choices=COSTS), p.add_argument("--vendor")
+    p.add_argument("--cwd"), p.add_argument("--ttl", default="2h"), p.add_argument("--timeout", help="e.g. 30m"), p.add_argument("--dry", action="store_true", help="print command, don't run")
+    p.add_argument("--force", action="store_true")
+
+    p = sp("handoff", cmd_handoff, "close a task by hand: write HANDOFF.md, emit END/BLOCKED")
+    p.add_argument("task"), p.add_argument("--status", choices=tuple(FINAL)), p.add_argument("--text"), p.add_argument("--file", help="HANDOFF.md from file ('-' = stdin)")
+
+    s = group("usage", "usage: add")
+    q = sp("add", cmd_usage, "record a ledger row", s)
+    q.add_argument("--account", required=True), q.add_argument("--hand"), q.add_argument("--task"), q.add_argument("--units", type=int, default=1)
+    q.add_argument("--tokens-in", type=int), q.add_argument("--tokens-out", type=int), q.add_argument("--cost-usd", type=float)
+
+    p = sp("ledger", cmd_ledger, "usage totals per account")
+    p.add_argument("--account"), p.add_argument("--since", help="e.g. 24h")
+    p = sp("events", cmd_events, "read the decklog")
+    p.add_argument("-n", type=int, default=20), p.add_argument("-f", "--follow", action="store_true"), p.add_argument("--type", help="comma list, e.g. END,BLOCKED"), p.add_argument("--since")
+    p = sp("event", cmd_event, "emit an event (e.g. NOTE)")
+    p.add_argument("type"), p.add_argument("--task"), p.add_argument("--hand"), p.add_argument("--msg")
+    sp("mcp", cmd_mcp, "serve the deck over MCP stdio")
+    return ap
+
+
+def main(argv=None):
+    ap = build_parser()
+    a = ap.parse_args(argv)
+    if not getattr(a, "fn", None):
+        getattr(a, "group", ap).print_help()
+        return 1
+    if a.fn is cmd_init:
+        return cmd_init(a)
+    return a.fn(Deck.find(), a)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

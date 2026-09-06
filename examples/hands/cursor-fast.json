@@ -1,0 +1,9 @@
+{
+  "id": "cursor-fast",
+  "vendor": "cursor",
+  "account": "cursor-pro",
+  "model": "composer-2.5-fast",
+  "cost": "low",
+  "cmd": "cursor-agent -p --force --output-format json --model composer-2.5-fast {prompt}",
+  "notes": "Cheap, quick edits. Swap {prompt} for `< {context}` style piping if your context is large."
+}
