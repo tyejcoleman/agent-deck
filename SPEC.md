@@ -34,11 +34,32 @@ folder lives (git, SSH, Syncthing, a VPS). Two machines sharing the folder share
 
 All records are flat JSON objects with an `id`. Unknown keys are preserved; add what you need.
 
-**ACCOUNT** — `{"id", "vendor", "login", "window": "5h", "limit": 100, "metric": "runs|tokens",
-"cooldown_until", "env": {...}}`. `login` is a pointer ("tye@… via `claude login` on mac-mini"), never
-a secret. `env` is applied to hands on this account when they run — this is how several logins of one
-vendor coexist on one machine (e.g. `CLAUDE_CONFIG_DIR`, `CODEX_HOME`). Headroom = `limit` minus usage
-in the trailing `window` (from LEDGER). `cooldown_until` marks the account exhausted until that time.
+**ACCOUNT** — `{"id", "vendor", "auth": "oauth|apikey|none", "env": {...}, "key_env", "base_url",
+"limits": {"5h": 200, "1w": 1000}, "metric": "runs|tokens", "price": {"in": 3, "out": 15},
+"monthly_usd", "check": {"ok", "at", "msg"}, "cooldown_until", "login", "usage_cmd", "status_cmd",
+"login_cmd"}`. The record never contains a secret:
+
+- `oauth` — the vendor CLI owns the login (Claude Code, Codex, Cursor, Gemini). `env` points its
+  config-dir variable (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `CURSOR_CONFIG_DIR`, `GEMINI_CLI_HOME`) at
+  `~/.config/deck/homes/<id>` (mode 0700), so any number of logins per vendor coexist and tokens
+  refresh themselves as long as that dir persists. `deck account login <id>` runs the vendor's login
+  (browser, or device code / paste-URL with `--headless`) — a human step by design.
+- `apikey` — deck keeps the key in the OS keychain (macOS `security`, Linux `secret-tool`, else a 0600
+  file under `~/.config/deck/secrets/`) and injects it as `key_env` into the worker's environment
+  only. `deck account login <id>` reads it from a hidden prompt, `--from-env`, `--from-file` (then
+  deleted), or a pipe. `DECK_SECRET_<ID>` in the environment overrides the store (CI).
+- `none` — local servers (Ollama, LM Studio); `base_url` is health-checked and models are listed.
+
+`check` is the cached result of `deck account check` (login status command, key presence, or HTTP
+health) — refreshed by `deck run` when stale or failing, so a run never burns a claim on a dead login.
+A worker that reports an auth failure flips `check.ok` to false (for API keys, the rejected key's
+fingerprint is remembered until a different key is stored). Hands on such an account show
+`needs-login` (or `down`) and are excluded from routing.
+
+Headroom = tightest of the `limits` windows minus LEDGER usage in that window; an optional `remote`
+reading from `deck account sync` (runs `usage_cmd`, expected to print `{used, limit, window?, reset_at?}`)
+joins the comparison when fresher than an hour. `price` (USD per 1M tokens) computes `cost_usd` for
+runs whose vendor reports tokens but no cost. `monthly_usd` is informational (shown in `deck ledger`).
 
 **HAND** — `{"id", "vendor", "account", "model", "cost": "low|mid|high", "cmd"}`. `cmd` is a shell
 string. Placeholders: `{prompt}` (shell-quoted), `{context}`, `{handoff}` (absolute paths), `{task}`.
@@ -63,8 +84,9 @@ vendor JSON output (`"input_tokens"`, `"output_tokens"`, `"total_cost_usd"`). An
 usage with `deck usage add`.
 
 **EVENT** — `{"ts", "type", "task", "hand", "by", "msg", ...}`. Types: `TASK` `CLAIM` `RELEASE`
-`START` `END` `BLOCKED` `FAILED` `COOLDOWN` `ACCOUNT` `HAND` `NOTE`. Free to extend; keep them
-uppercase and short.
+`START` `END` `BLOCKED` `FAILED` `COOLDOWN` `AUTH` `ACCOUNT` `HAND` `NOTE`. `AUTH` fires when an
+account's usability flips (`ok: true|false`) and carries the exact fix (`run: deck account login <id>`);
+it is the event a meta-agent forwards to the human. Free to extend; keep them uppercase and short.
 
 ## 3. Lifecycle
 
@@ -89,7 +111,8 @@ Workers driven by hand (interactive Claude Code, a human) close the loop with
 
 `deck route [--cost c] [--vendor v]` ranks free hands:
 
-1. exclude claimed, cooling-down, or exhausted hands (account headroom ≤ 0), and vendor mismatches;
+1. exclude claimed, needs-login/down, cooling-down, or exhausted hands (account headroom ≤ 0), and
+   vendor mismatches;
 2. sort by cost-class distance from the requested `cost`, then most remaining headroom fraction,
    then least recently used.
 
@@ -112,7 +135,17 @@ implement a different policy by reading the same files; the CLI's version is ~20
 without learning the CLI. Every tool maps 1:1 to a CLI invocation and returns its `--json` output.
 The files stay the protocol; MCP is convenience.
 
-## 7. Non-goals
+## 7. Security posture
 
-Scheduling, retries with backoff, multi-step DAGs, chat between hands, a UI, a database, a cloud.
-If you need those, build them *on* the files — don't add them to the protocol.
+`.deck/` is safe to sync and commit: it holds pointers, limits, and state, never credentials. OAuth
+tokens live where the vendor CLI puts them (per-account dirs under `~/.config/deck/homes/`, 0700);
+API keys live in the OS keychain or a 0600 file under `~/.config/deck/secrets/`. Secrets reach exactly
+one place: the environment of the worker process that needs them. The CLI never prints them, `--json`
+never includes them, and MCP exposes no login tool — logging in is a human action in a terminal, where
+an agent may relay the printed URL / one-time device code but never sees a token.
+
+## 8. Non-goals
+
+Scheduling, retries with backoff, multi-step DAGs, chat between hands, a UI, a database, a cloud, a
+token-refresh daemon (the vendor CLIs already do that). If you need those, build them *on* the files —
+don't add them to the protocol.

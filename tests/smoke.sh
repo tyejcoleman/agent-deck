@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end smoke test using fake hands (no vendor CLIs needed). Run: bash tests/smoke.sh
-# shellcheck disable=SC2015  # `cond && pass || fail` is safe: pass is a plain echo and cannot fail
+# shellcheck disable=SC2015,SC2016  # `cond && pass || fail` is safe (pass is an echo); single-quoted $VARs are meant for deck, not this shell
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HERE:$PATH" DECK_AGENT=test
@@ -14,7 +14,7 @@ deck init --name smoke >/dev/null
 [ -f .deck/deck.json ] && [ -f .deck/AGENTS.md ] || fail init
 deck init >/dev/null && pass "init idempotent" || fail "init idempotent"
 
-deck account add fake --vendor custom --limit 2 --window 1h --env FOO=bar >/dev/null
+deck account add fake --vendor custom --limit 2/1h --env FOO=bar >/dev/null
 deck account add other --vendor custom --limit 10 >/dev/null
 deck hand add ok --account fake --cost low --cmd 'python3 -c "import os,sys; sys.stdin.read(); assert os.environ[\"FOO\"]==\"bar\"; open(os.environ[\"DECK_HANDOFF\"],\"w\").write(\"## Status\\nEND\\n## What changed\\nx\\n\"); print(\"{\\\"usage\\\":{\\\"input_tokens\\\":10,\\\"output_tokens\\\":5}}\")"' >/dev/null
 deck hand add rl --account other --cost mid --cmd 'sh -c "echo rate limit reached; exit 1"' >/dev/null
@@ -94,7 +94,7 @@ python3 -c "import json; json.dump({'hand':'argv','task':'old','by':'ghost','sin
 expect 0 deck claim argv --task new
 pass "expired claim taken over"; deck release argv >/dev/null
 
-deck account add tok --vendor custom --metric tokens --limit 100 --window 1h >/dev/null
+deck account add tok --vendor custom --metric tokens --limit 100/1h >/dev/null
 deck hand add tokh --account tok --cmd 'echo "{\"usage\":{\"input_tokens\":90,\"output_tokens\":20}}"' >/dev/null
 deck task add tk --id t12 >/dev/null; expect 0 deck run t12 --hand tokh
 [ "$(deck status --json | python3 -c 'import json,sys; print([h["state"] for h in json.load(sys.stdin)["hands"] if h["id"]=="tokh"][0])')" = exhausted ] && pass "token-metric headroom" || fail "token-metric headroom"
@@ -105,6 +105,40 @@ grep -q "skipping bad line" out.txt && grep -q "tokh" out.txt && pass "torn json
 echo '{oops' > .deck/hands/broken.json
 expect 1 deck status
 grep -q "bad JSON in hands/broken.json" out.txt && pass "corrupt record named"; rm .deck/hands/broken.json
+
+# ---- accounts: auth modes, secrets, costs (file secret store under a scratch HOME) ----
+export DECK_SECRETS=file HOME="$TMP/home"; mkdir -p "$HOME"
+deck account add oa --vendor custom --auth oauth --env OA_HOME="~/.config/deck/homes/oa" --status-cmd 'test -f "$OA_HOME/token"' \
+  --login-cmd 'mkdir -p "$OA_HOME" && printf %s "$OA_SECRET" > "$OA_HOME/token"' >/dev/null
+[ "$(deck account ls --json | python3 -c 'import json,sys; print([a["check"]["ok"] for a in json.load(sys.stdin) if a["id"]=="oa"][0])')" = False ] && pass "oauth account starts needs-login" || fail "oauth account starts needs-login"
+OA_SECRET=real-oauth-token deck account login oa >/dev/null
+grep -q '"type": "AUTH", "account": "oa", "ok": true' .deck/events.jsonl && grep -q real-oauth-token "$HOME/.config/deck/homes/oa/token" && ! grep -rq real-oauth-token .deck && pass "oauth login -> AUTH ok, token outside .deck" || fail "oauth login"
+
+export SMOKE_KEY="sk-test-abcdef"
+deck account add api --vendor custom --auth apikey --key-env SMOKE_API_KEY --price 3/15 >/dev/null
+deck account login api --from-env SMOKE_KEY >/dev/null
+[ "$(stat -c %a "$HOME/.config/deck/secrets/api")" = 600 ] && ! grep -rq "sk-test" .deck && pass "apikey stored 0600 outside .deck" || fail "apikey storage"
+deck hand add apih --account api --cost low --cmd 'sh -c "cat >/dev/null; [ \${#SMOKE_API_KEY} = 14 ] || exit 9; echo {\\\"usage\\\":{\\\"input_tokens\\\":1000000,\\\"output_tokens\\\":100000}}"' >/dev/null
+deck task add "api" --id t13 >/dev/null; expect 0 deck run t13 --hand apih
+grep -q '"cost_usd": 4.5' .deck/ledger.jsonl && ! grep -rq "sk-test" .deck && pass "key injected into worker; cost from price" || fail "key injection / cost"
+
+deck hand add rej --account api --cost low --cmd 'sh -c "echo invalid api key; exit 1"' >/dev/null
+deck task add "rej" --id t14 >/dev/null; expect 2 deck run t14 --hand rej
+grep -q '"type": "AUTH", "account": "api", "ok": false' .deck/events.jsonl && pass "worker auth failure -> BLOCKED + AUTH" || fail "auth failure detection"
+expect 1 deck account check api
+grep -q "rejected" out.txt && pass "rejected key stays needs-login" || fail "rejected key"
+export SMOKE_KEY2="sk-test-new"; deck account login api --from-env SMOKE_KEY2 >/dev/null
+expect 0 deck account check api; pass "new key clears rejection"
+
+deck account add loc --vendor ollama --base-url http://127.0.0.1:1 >/dev/null 2>&1
+[ "$(deck status --json | python3 -c 'import json,sys; a=[h for h in json.load(sys.stdin)["hands"]]; print("ok")')" = ok ] || fail status
+deck hand add loch --account loc --cmd true >/dev/null
+deck status | grep -q "loch .*down" && pass "local server down -> hand state down" || fail "local down state"
+
+deck account add mw --vendor custom --auth none --limit 5/5h --limit 3/1w --metric runs >/dev/null
+deck hand add mwh --account mw --cmd 'sh -c "cat >/dev/null"' >/dev/null
+for i in 1 2 3; do deck task add "mw$i" --id mw$i >/dev/null; deck run mw$i --hand mwh >/dev/null; done
+[ "$(deck account ls --json | python3 -c 'import json,sys; a=[x for x in json.load(sys.stdin) if x["id"]=="mw"][0]["headroom"]; print(a["window"], a["state"])')" = "1w exhausted" ] && pass "multi-window: tightest window governs" || fail "multi-window"
 
 deck event NOTE --msg hi >/dev/null
 [ "$(deck events --type NOTE -n 1 --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["msg"])')" = hi ] && pass "events filter" || fail "events filter"

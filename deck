@@ -7,27 +7,51 @@ Zero dependencies. Python 3.8+. Copy it anywhere on PATH.
 import argparse
 import contextlib
 import datetime as dt
+import getpass
+import hashlib
 import io
 import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 import uuid
 from pathlib import Path
 
-VERSION = "0.1.0"
-COSTS = ("low", "mid", "high")
-# vendor: (command template, model flag, default cost). Templates are a starting point; edit hands/<id>.json freely.
+VERSION = "0.2.0"
+COSTS = ("free", "low", "mid", "high")
+HOMES = "~/.config/deck/homes"      # one vendor login dir per account; tokens live there (or the OS keychain), never in .deck/
+SECRETS = "~/.config/deck/secrets"  # 0600 files, used only when no keychain/libsecret is available
+# Vendor table. Auth modes an account can use: oauth (the vendor CLI owns the login; `home` env isolates one
+# login per account), apikey (deck keeps the key in the OS keychain and injects `key` into the worker env),
+# none (local servers; `base_url` + `health`). cmd/flag/cost seed hands; edit hands/<id>.json freely.
 VENDORS = {
-    "claude": ("claude -p --permission-mode acceptEdits --output-format json{model} {prompt}", "--model", "high"),
-    "codex": ("codex exec --sandbox workspace-write --skip-git-repo-check --json{model} {prompt}", "-m", "mid"),
-    "cursor": ("cursor-agent -p --force --output-format json{model} {prompt}", "--model", "mid"),
+    "claude": dict(home="CLAUDE_CONFIG_DIR", key="ANTHROPIC_API_KEY", login="claude auth login", status="claude auth status",
+                   logout="claude auth logout", cmd="claude -p --permission-mode acceptEdits --output-format json{model} {prompt}",
+                   flag="--model", cost="high"),
+    "codex": dict(home="CODEX_HOME", key="OPENAI_API_KEY", login="codex login", headless="codex login --device-auth",
+                  status="codex login status", logout="codex logout",
+                  cmd="codex exec --sandbox workspace-write --skip-git-repo-check --json{model} {prompt}", flag="-m", cost="mid"),
+    "cursor": dict(home="CURSOR_CONFIG_DIR", key="CURSOR_API_KEY", login="cursor-agent login", headless_env={"NO_OPEN_BROWSER": "1"},
+                   status="cursor-agent status", logout="cursor-agent logout",
+                   cmd="cursor-agent -p --force --output-format json{model} {prompt}", flag="--model", cost="mid"),
+    "gemini": dict(home="GEMINI_CLI_HOME", key="GEMINI_API_KEY", login="gemini", headless_env={"NO_BROWSER": "true"},
+                   status="file:.gemini/oauth_creds.json", login_hint="pick 'Login with Google', finish in the browser, then /quit",
+                   cmd="gemini -p {prompt} --approval-mode yolo --output-format json{model}", flag="-m", cost="low"),
+    "ollama": dict(base_url="http://localhost:11434", health="/api/tags", env={"OLLAMA_HOST": "{base_url}"},
+                   cmd="codex exec --oss --local-provider ollama --sandbox workspace-write --skip-git-repo-check --json{model} {prompt}",
+                   flag="-m", cost="free"),
+    "lmstudio": dict(base_url="http://localhost:1234", health="/v1/models",
+                     cmd="codex exec --oss --local-provider lmstudio --sandbox workspace-write --skip-git-repo-check --json{model} {prompt}",
+                     flag="-m", cost="free"),
 }
-USAGE_RE = {"tokens_in": r'"input_tokens":\s*(\d+)', "tokens_out": r'"output_tokens":\s*(\d+)', "cost_usd": r'"total_cost_usd":\s*([\d.]+)'}
 RATE_LIMIT_RE = r"(?i)rate.?limit|usage limit|hit your limit|quota exceeded|too many requests|\b429\b"
+AUTH_FAIL_RE = r"(?i)not logged in|please run /login|run 'agent login'|authentication required|invalid (api )?key|unauthorized|\b401\b|login required|token.{0,20}expired"
+LOGGED_OUT_RE = r"(?i)not logged in|logged out|no credentials|not authenticated"
 FINAL = {"END": "done", "BLOCKED": "blocked", "FAILED": "failed"}
 
 PROMPT = """You are a worker hand on an Agent Deck. Task {id}: {title}
@@ -45,22 +69,29 @@ AGENTS_MD = """# Agent Deck - read me first (any agent landing here)
 This folder is the deck: a roster of coding-agent "hands", the accounts they bill to, and the tasks in
 flight. The files are the protocol; the `deck` CLI is a convenience. Full spec: https://github.com/tyejcoleman/agent-deck
 
-- accounts/<id>.json   vendor login pointer + rate window + env (never secrets)
-- hands/<id>.json      worker preset: vendor, account, model, cmd, cost class
+- accounts/<id>.json   vendor + auth mode + rate windows + env + last auth check (never secrets)
+- hands/<id>.json      worker preset: vendor, account, model, cmd, cost class, price
 - tasks/<id>/          task.json, CONTEXT.md (what the worker needs), HANDOFF.md (what it left), runs/*.log
 - claims/<hand>.json   who holds a hand right now (expires at `until`)
 - ledger.jsonl         usage per run: units, tokens, seconds, cost
-- events.jsonl         append-only decklog: TASK CLAIM START END BLOCKED FAILED COOLDOWN NOTE
+- events.jsonl         append-only decklog: TASK CLAIM START END BLOCKED FAILED COOLDOWN AUTH NOTE
 - hooks.d/             executables named <TYPE>-* or any-* run on each event (wake meta-agents)
 
 META-AGENT (Cos, OpenClaw, Grok bot, human):
-  deck status                    what's free / claimed / exhausted, headroom per account
+  deck status                    what's free / claimed / exhausted / needs-login, headroom per account
   deck task add "title"          then edit tasks/<id>/CONTEXT.md
   deck run <task> [--hand H]     route -> claim -> run hand -> ledger -> HANDOFF.md -> END|BLOCKED event
-  deck events -f                 wake on END/BLOCKED, read HANDOFF.md, steer the next task
-  deck --json <anything>         machine output
+  deck events -f                 wake on END/BLOCKED/AUTH, read HANDOFF.md, steer the next task
+  deck <command> --json          machine output
 
-WORKER (Claude Code, Codex, Cursor) started by `deck run`:
+ACCOUNTS (agents set them up; only humans log in):
+  deck account add <id> --vendor claude|codex|cursor|gemini|ollama|lmstudio [--auth oauth|apikey] [--limit 200/5h]
+  deck account check [id]        refresh auth state without touching secrets
+  On an AUTH event (or a hand in needs-login): tell the human exactly this, nothing else:
+      deck account login <id>            (add --headless on a VPS: prints a URL + one-time code)
+  Never ask for a key in chat. Never read ~/.config/deck. Tokens stay in the vendor's dir or the OS keychain.
+
+WORKER (Claude Code, Codex, Cursor, Gemini) started by `deck run`:
   read $DECK_CONTEXT, do the work, write $DECK_HANDOFF with headings
   "## Status" (END|BLOCKED) "## What changed" "## Open questions" "## Next step", then exit.
   Manual close: deck handoff <task> --status END --text "..."
@@ -130,23 +161,173 @@ def parse_status(text):
     return m.group(1).upper() if m else "END"
 
 
+def scan_json(output):
+    """JSON objects in worker output: one document (Claude, Gemini) or JSONL (Codex, stream modes)."""
+    try:
+        obj = json.loads(output)
+        return [obj] if isinstance(obj, dict) else []
+    except ValueError:
+        objs = []
+        for line in output.splitlines():
+            try:
+                obj = json.loads(line)
+                objs.append(obj) if isinstance(obj, dict) else None
+            except ValueError:
+                pass
+        return objs
+
+
+def parse_usage(output):
+    """Tokens/cost from vendor JSON: Claude `usage`+`total_cost_usd`, Codex `turn.completed.usage`, Gemini `stats.models`."""
+    u = {"tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0}
+    for o in scan_json(output):
+        us = o.get("usage") if isinstance(o.get("usage"), dict) else {}
+        u["tokens_in"] += int(us.get("input_tokens") or 0)
+        u["tokens_out"] += int(us.get("output_tokens") or 0)
+        u["cost_usd"] += float(o.get("total_cost_usd") or 0)
+        for m in (((o.get("stats") or {}).get("models") or {}) if isinstance(o.get("stats"), dict) else {}).values():
+            t = (m or {}).get("tokens") or {}
+            u["tokens_in"] += int(t.get("prompt") or t.get("input") or 0)
+            u["tokens_out"] += int(t.get("candidates") or 0)
+    return {k: v for k, v in u.items() if v}
+
+
 def result_text(output, lines=40):
-    """Best-effort final message: Claude json `result`, Codex JSONL last agent_message, else the tail."""
+    """Best-effort final message: Claude `result`, Gemini `response`, Codex last agent_message / error, else the tail."""
     final = None
-    for line in output.strip().splitlines():
-        try:
-            obj = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(obj, dict):
-            item = obj.get("item") or {}
-            if isinstance(obj.get("result"), str):
-                final = obj["result"]
-            elif item.get("type") == "agent_message" and isinstance(item.get("text"), str):
-                final = item["text"]
-            elif isinstance(obj.get("error"), dict) and obj["error"].get("message"):
-                final = "error: %s" % obj["error"]["message"]
+    for o in scan_json(output):
+        item = o.get("item") or {}
+        for cand in (o.get("result"), o.get("response"), item.get("text") if item.get("type") == "agent_message" else None):
+            if isinstance(cand, str) and cand.strip():
+                final = cand
+        if isinstance(o.get("error"), dict) and o["error"].get("message"):
+            final = "error: %s" % o["error"]["message"]
     return final or "\n".join(output.strip().splitlines()[-lines:])
+
+
+# ---------- secrets & auth (nothing here ever touches .deck/) ----------
+def secret_backend():
+    forced = os.environ.get("DECK_SECRETS")
+    if forced:
+        return forced
+    if sys.platform == "darwin" and shutil.which("security"):
+        return "keychain"
+    return "libsecret" if shutil.which("secret-tool") else "file"
+
+
+def secret_get(aid):
+    env = os.environ.get("DECK_SECRET_" + re.sub(r"\W", "_", aid).upper())
+    if env:
+        return env
+    b = secret_backend()
+    if b == "keychain":
+        r = subprocess.run(["security", "find-generic-password", "-s", "deck", "-a", aid, "-w"], capture_output=True, text=True)
+        return r.stdout.strip() or None
+    if b == "libsecret":
+        r = subprocess.run(["secret-tool", "lookup", "service", "deck", "account", aid], capture_output=True, text=True)
+        return r.stdout.strip() or None
+    f = Path(SECRETS).expanduser() / aid
+    return f.read_text(encoding="utf-8").strip() or None if f.exists() else None
+
+
+def secret_set(aid, value):
+    b = secret_backend()
+    if b == "keychain":
+        subprocess.run(["security", "add-generic-password", "-U", "-s", "deck", "-a", aid, "-w", value], check=True, capture_output=True)
+    elif b == "libsecret":
+        subprocess.run(["secret-tool", "store", "--label", "deck " + aid, "service", "deck", "account", aid], input=value, text=True, check=True)
+    else:
+        d = Path(SECRETS).expanduser()
+        d.mkdir(parents=True, exist_ok=True)
+        os.chmod(str(d), 0o700)
+        fd = os.open(str(d / aid), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(value)
+    return b
+
+
+def secret_del(aid):
+    b = secret_backend()
+    if b == "keychain":
+        subprocess.run(["security", "delete-generic-password", "-s", "deck", "-a", aid], capture_output=True)
+    elif b == "libsecret":
+        subprocess.run(["secret-tool", "clear", "service", "deck", "account", aid], capture_output=True)
+    else:
+        f = Path(SECRETS).expanduser() / aid
+        f.exists() and f.unlink()
+
+
+def acct_env(acct):
+    """Environment the vendor CLI gets for this account. May contain the API key: pass to processes, never print."""
+    env = {k: os.path.expanduser(str(v)) for k, v in acct.get("env", {}).items()}
+    if acct.get("auth") == "apikey" and acct.get("key_env"):
+        secret = secret_get(acct["id"])
+        if secret:
+            env[acct["key_env"]] = secret
+    return env
+
+
+def check_account(deck, acct, quiet=True):
+    """Refresh acct['check'] = {ok, at, msg} without exposing secrets. Emits AUTH only when the state flips."""
+    v, env, auth = VENDORS.get(acct.get("vendor"), {}), dict(os.environ, **acct_env(acct)), acct.get("auth", "none")
+    ok, msg, models, prevc = True, "ok", None, acct.get("check") or {}
+    if auth == "apikey":
+        secret = secret_get(acct["id"])
+        ok, msg = bool(secret), "key in %s" % secret_backend() if secret else "no key stored"
+        if secret and prevc.get("rejected") == hashlib.sha256(secret.encode()).hexdigest()[:12]:
+            ok, msg = False, "key rejected by the vendor; store a new one"
+    elif auth == "oauth":
+        st = acct.get("status_cmd") or v.get("status")
+        if not st:
+            msg = "unknown (no status command; set status_cmd)"
+        elif st.startswith("file:"):
+            ok = (Path(env.get(v.get("home") or "", os.path.expanduser("~"))) / st[5:]).exists()
+            msg = "logged in" if ok else "not logged in"
+        else:
+            try:
+                r = subprocess.run(st, shell=True, env=env, capture_output=True, text=True, timeout=60)
+                ok = r.returncode == 0 and not re.search(LOGGED_OUT_RE, r.stdout + r.stderr)
+                msg = "logged in" if ok else "not logged in"
+            except (OSError, subprocess.TimeoutExpired) as e:
+                ok, msg = False, "status check failed: %s" % e
+    elif acct.get("base_url"):
+        try:
+            with urllib.request.urlopen(acct["base_url"].rstrip("/") + v.get("health", "/"), timeout=3) as r:
+                body = json.loads(r.read().decode("utf-8", "replace") or "{}")
+            models = [m.get("name") or m.get("id") for m in (body.get("models") or body.get("data") or []) if isinstance(m, dict)]
+            msg = "up (%d models)" % len(models) if models else "up"
+        except Exception as e:
+            ok, msg = False, "down (%s)" % e
+    prev = prevc.get("ok")
+    acct["check"] = {"ok": ok, "at": iso(now()), "msg": msg}
+    if not ok and prevc.get("rejected"):
+        acct["check"]["rejected"] = prevc["rejected"]
+    if models is not None:
+        acct["models"] = models
+    deck.save(acct, "accounts", acct["id"] + ".json")
+    fix = "" if ok else ("run: deck account login %s" % acct["id"] if auth != "none" else "start the server at %s" % acct.get("base_url"))
+    if prev != ok and (prev is not None or not ok):  # flips, and a first check that already fails
+        emit(deck, "AUTH", account=acct["id"], ok=ok, msg=msg if ok else "%s; %s" % (msg, fix))
+    if not quiet:
+        print("%s: %s%s" % (acct["id"], msg, "  ->  " + fix if fix else ""))
+    return ok
+
+
+def auth_state(acct):
+    """None when usable, else 'needs-login' (oauth/apikey) or 'down' (local server)."""
+    if (acct.get("check") or {}).get("ok") is not False:
+        return None
+    return "needs-login" if acct.get("auth", "none") != "none" else "down"
+
+
+def auth_ok(deck, acct, max_age=3600):
+    """Cached auth state, refreshed when stale or previously failing, so a run never burns a claim on a dead login."""
+    if acct.get("auth", "none") == "none" and not acct.get("base_url"):
+        return True
+    c = acct.get("check") or {}
+    if c.get("ok") and c.get("at") and (now() - ts(c["at"])).total_seconds() < max_age:
+        return True
+    return check_account(deck, acct)
 
 
 # ---------- deck ----------
@@ -226,15 +407,25 @@ def emit(deck, type_, **kw):
 
 
 def headroom(acct, ledger):
-    t, win, metric = now(), dur(acct.get("window", "5h")), acct.get("metric", "runs")
-    rows = [r for r in ledger if r.get("account") == acct["id"] and (t - ts(r["ts"])).total_seconds() < win]
-    used = sum((r.get("units", 1) if metric == "runs" else (r.get("tokens_in") or 0) + (r.get("tokens_out") or 0)) for r in rows)
-    limit, cool = acct.get("limit"), acct.get("cooldown_until")
-    state = "cooldown" if cool and ts(cool) > t else "exhausted" if limit and used >= limit else "ok"
-    return {"account": acct["id"], "metric": metric, "used": used, "limit": limit,
-            "left": (limit - used) if limit else None, "frac": max(0.0, 1 - used / limit) if limit else 1.0,
-            "reset_at": iso(ts(min(r["ts"] for r in rows)) + dt.timedelta(seconds=win)) if rows else None,
-            "cooldown_until": cool if state == "cooldown" else None, "state": state}
+    """Tightest of the account's rate windows (`limits: {"5h": 200, "1w": 1000}`), from the ledger plus an optional
+    fresh `remote` reading (`deck account sync`). Subscription windows are estimates unless synced."""
+    t, metric = now(), acct.get("metric", "runs")
+    limits = acct.get("limits") or ({acct["window"]: acct["limit"]} if acct.get("limit") else {acct.get("window", "5h"): None})
+    mine = [r for r in ledger if r.get("account") == acct["id"]]
+    wins = []
+    for win, limit in limits.items():
+        rows = [r for r in mine if (t - ts(r["ts"])).total_seconds() < dur(win)]
+        used = sum((r.get("units", 1) if metric == "runs" else (r.get("tokens_in") or 0) + (r.get("tokens_out") or 0)) for r in rows)
+        wins.append({"window": win, "used": used, "limit": limit, "frac": max(0.0, 1 - used / limit) if limit else 1.0,
+                     "reset_at": iso(ts(min(r["ts"] for r in rows)) + dt.timedelta(seconds=dur(win))) if rows else None})
+    rem = acct.get("remote") or {}
+    if rem.get("at") and (t - ts(rem["at"])).total_seconds() < 3600 and rem.get("limit"):
+        wins.append({"window": rem.get("window", "remote"), "used": rem["used"], "limit": rem["limit"], "remote": True,
+                     "frac": max(0.0, 1 - rem["used"] / rem["limit"]), "reset_at": rem.get("reset_at")})
+    tight, cool = min(wins, key=lambda w: (w["frac"], dur(w["window"]) if re.fullmatch(r"\d+[smhdw]", w["window"]) else 0)), acct.get("cooldown_until")
+    state = "cooldown" if cool and ts(cool) > t else "exhausted" if tight["limit"] and tight["used"] >= tight["limit"] else "ok"
+    return dict(tight, account=acct["id"], metric=metric, windows=wins, state=state,
+                left=(tight["limit"] - tight["used"]) if tight["limit"] else None, cooldown_until=cool if state == "cooldown" else None)
 
 
 def claim_of(deck, hand):
@@ -247,12 +438,14 @@ def claim_of(deck, hand):
 
 def roster(deck):
     ledger = deck.rows("ledger.jsonl")
-    hr = {a["id"]: headroom(a, ledger) for a in deck.items("accounts")}
+    accts = {a["id"]: a for a in deck.items("accounts")}
+    hr = {aid: headroom(a, ledger) for aid, a in accts.items()}
     last = {r.get("hand"): r["ts"] for r in ledger}
     res = []
     for h in deck.items("hands"):
         c, a = claim_of(deck, h["id"]), hr.get(h.get("account"))
-        state = "claimed" if c else "no-account" if not a else "free" if a["state"] == "ok" else a["state"]
+        bad = auth_state(accts.get(h.get("account")) or {})
+        state = "claimed" if c else "no-account" if not a else bad if bad else "free" if a["state"] == "ok" else a["state"]
         res.append(dict(h, state=state, claim=c, headroom=a, last_used=last.get(h["id"])))
     return res
 
@@ -310,29 +503,123 @@ def cmd_init(a):
     for f in ("events.jsonl", "ledger.jsonl"):
         (root / f).touch()
     (root / "AGENTS.md").write_text(AGENTS_MD, encoding="utf-8")
-    out(a, {"deck": str(root)}, "deck ready: %s\nnext: deck account add <id> --vendor claude|codex|cursor\n      deck hand add <id> --account <id> [--model M]" % root)
+    out(a, {"deck": str(root)}, "deck ready: %s\nnext: deck account add <id> --vendor claude|codex|cursor|gemini|ollama --now\n      deck hand add <id> --account <id> [--model M]" % root)
+
+
+def parse_price(s):  # "3/15" -> USD per million tokens in/out
+    m = re.fullmatch(r"([\d.]+)/([\d.]+)", s or "")
+    return {"in": float(m.group(1)), "out": float(m.group(2))} if m else die("bad price %r (use IN/OUT per 1M tokens, e.g. 3/15)" % s)
+
+
+def account_add(deck, a):
+    f = deck.p("accounts", a.id + ".json")
+    rec = dict(deck.parse(f) if f.exists() else {}, id=a.id)
+    for k in ("vendor", "login", "metric", "notes", "base_url", "usage_cmd", "status_cmd", "login_cmd", "monthly_usd"):
+        if getattr(a, k) is not None:
+            rec[k] = getattr(a, k)
+    rec.setdefault("vendor", "custom"), rec.setdefault("metric", "runs")
+    v = VENDORS.get(rec["vendor"], {})
+    if a.limit is not None:
+        limits = {}
+        for spec in a.limit:
+            n, _, win = spec.partition("/")
+            limits[win or "5h"] = int(n)
+            dur(win or "5h")
+        rec["limits"] = {w: n for w, n in limits.items() if n} or None
+        rec.pop("limit", None), rec.pop("window", None)
+    rec["auth"] = a.auth or rec.get("auth") or ("oauth" if v.get("home") else "apikey" if v.get("key") or a.key_env else "none")
+    if rec["auth"] == "apikey":
+        rec["key_env"] = a.key_env or rec.get("key_env") or v.get("key") or die("--key-env NAME required for an apikey account on vendor %r" % rec["vendor"])
+    env = dict(rec.get("env", {}))
+    if rec["auth"] == "oauth" and v.get("home") and a.home != "default":
+        env[v["home"]] = a.home or env.get(v["home"]) or "%s/%s" % (HOMES, a.id)
+    if v.get("base_url"):
+        rec.setdefault("base_url", v["base_url"])
+        for k, val in v.get("env", {}).items():
+            env.setdefault(k, val.format(base_url=rec["base_url"]))
+    if a.env:
+        env.update(dict(kv.split("=", 1) for kv in a.env))
+    if env:
+        rec["env"] = env
+    if a.price:
+        rec["price"] = parse_price(a.price)
+    deck.save(rec, "accounts", a.id + ".json")
+    emit(deck, "ACCOUNT", account=a.id, by=who(a))
+    if a.login_now:
+        print("account %s saved (%s, auth=%s)" % (a.id, rec["vendor"], rec["auth"]))
+        return account_login(deck, rec, a)
+    ok = check_account(deck, rec)
+    hint = "" if ok else ("\nnext: deck account login %s%s" % (a.id, "   (add --headless on a box without a browser)" if rec["auth"] == "oauth" else "")
+                          if rec["auth"] != "none" else "\nserver not reachable at %s" % rec.get("base_url"))
+    out(a, rec, "account %s saved (%s, auth=%s, limits=%s): %s%s" % (a.id, rec["vendor"], rec["auth"], rec.get("limits") or "none", rec["check"]["msg"], hint))
+
+
+def account_login(deck, acct, a):
+    v, auth = VENDORS.get(acct.get("vendor"), {}), acct.get("auth", "none")
+    env = dict(os.environ, **acct_env(acct))
+    if auth == "apikey":
+        if a.from_env:
+            key = os.environ.get(a.from_env) or die("$%s is empty" % a.from_env)
+        elif a.from_file:
+            key = Path(a.from_file).read_text(encoding="utf-8").strip()
+        elif not sys.stdin.isatty():
+            key = sys.stdin.read().strip()
+        else:
+            key = getpass.getpass("%s for account %s (hidden, stored in %s): " % (acct["key_env"], acct["id"], secret_backend()))
+        key or die("no key given")
+        backend = secret_set(acct["id"], key)
+        if a.from_file:
+            os.remove(a.from_file)
+        print("stored %s for %s in %s (sha256 %s). The deck folder holds no secret." % (acct["key_env"], acct["id"], backend, hashlib.sha256(key.encode()).hexdigest()[:12]))
+    elif auth == "oauth":
+        for k, val in env.items():
+            if k == v.get("home"):
+                Path(val).mkdir(parents=True, exist_ok=True)
+                os.chmod(val, 0o700)
+        cmd = acct.get("login_cmd") or (v.get("headless") if a.headless else None) or v.get("login") or die(
+            "no login command for vendor %r; log in with the vendor's own tool using env %s, then `deck account check %s`" % (acct["vendor"], acct.get("env"), acct["id"]))
+        if a.headless:
+            env.update(v.get("headless_env", {}))
+        print("Logging in account %s via `%s`. Tokens are kept by the vendor CLI under %s - never in the deck.%s" % (
+            acct["id"], cmd, env.get(v.get("home") or "", "its default dir"), "\n(%s)" % v["login_hint"] if v.get("login_hint") else ""), flush=True)
+        subprocess.call(cmd, shell=True, env=env)  # interactive: browser or device-code flow, the human finishes it
+    else:
+        die("account %s (auth=none) needs no login; try `deck account check %s`" % (acct["id"], acct["id"]))
+    ok = check_account(deck, acct, quiet=False)
+    return 0 if ok else 1
 
 
 def cmd_account(deck, a):
     if a.sub == "add":
-        f = deck.p("accounts", a.id + ".json")
-        rec = dict(deck.parse(f) if f.exists() else {}, id=a.id)
-        for k in ("vendor", "login", "window", "metric", "notes"):
-            if getattr(a, k) is not None:
-                rec[k] = getattr(a, k)
-        if a.limit is not None:
-            rec["limit"] = a.limit or None
-        if a.env:
-            rec["env"] = dict(rec.get("env", {}), **dict(kv.split("=", 1) for kv in a.env))
-        for k, v in (("vendor", "custom"), ("window", "5h"), ("metric", "runs")):
-            rec.setdefault(k, v)
-        dur(rec["window"])  # validate
-        deck.save(rec, "accounts", a.id + ".json")
-        emit(deck, "ACCOUNT", account=a.id, by=who(a))
-        return out(a, rec, "account %s saved (%s, %s %s per %s)" % (a.id, rec["vendor"], rec.get("limit") or "unlimited", rec["metric"], rec["window"]))
+        return account_add(deck, a)
+    if a.sub == "login":
+        return account_login(deck, deck.load("accounts", a.id + ".json"), a)
+    if a.sub == "check":
+        accts = [deck.load("accounts", a.id + ".json")] if a.id else deck.items("accounts")
+        oks = [check_account(deck, x, quiet=a.json) for x in accts]
+        return out(a, [x.get("check") for x in accts]) if a.json else (0 if all(oks) else 1)
+    if a.sub == "logout":
+        acct = deck.load("accounts", a.id + ".json")
+        v = VENDORS.get(acct.get("vendor"), {})
+        if acct.get("auth") == "apikey":
+            secret_del(a.id)
+        elif v.get("logout"):
+            subprocess.call(v["logout"], shell=True, env=dict(os.environ, **acct_env(acct)))
+        else:
+            die("no logout command for %s; remove its login dir: %s" % (a.id, acct.get("env")))
+        check_account(deck, acct)
+        return out(a, acct, "logged out %s" % a.id)
+    if a.sub == "sync":
+        acct = deck.load("accounts", a.id + ".json")
+        cmd = acct.get("usage_cmd") or die("account %s has no usage_cmd (a command printing JSON {used, limit, window?, reset_at?})" % a.id)
+        r = subprocess.run(cmd, shell=True, env=dict(os.environ, **acct_env(acct)), capture_output=True, text=True, timeout=120)
+        rem = json.loads(r.stdout or "{}") if r.returncode == 0 else die("usage_cmd failed: %s" % (r.stderr or r.stdout).strip())
+        acct["remote"] = dict(rem, at=iso(now()))
+        deck.save(acct, "accounts", a.id + ".json")
+        return out(a, acct["remote"], "synced %s: %s/%s used" % (a.id, rem.get("used"), rem.get("limit")))
     if a.sub == "rm":
         deck.p("accounts", a.id + ".json").unlink()
-        return out(a, {"removed": a.id}, "removed account %s" % a.id)
+        return out(a, {"removed": a.id}, "removed account %s (secret, if any, kept; `deck account logout` first to drop it)" % a.id)
     if a.sub == "cooldown":
         rec = deck.load("accounts", a.id + ".json")
         rec["cooldown_until"] = None if a.clear else a.until or iso(now() + dt.timedelta(seconds=dur(a.for_ or "1h")))
@@ -341,9 +628,17 @@ def cmd_account(deck, a):
         return out(a, rec, "account %s cooldown until %s" % (a.id, rec["cooldown_until"]))
     ledger = deck.rows("ledger.jsonl")
     rows = [dict(x, headroom=headroom(x, ledger)) for x in deck.items("accounts")]
-    out(a, rows, table(["ACCOUNT", "VENDOR", "STATE", "USED", "LIMIT", "WINDOW", "RESET", "LOGIN"],
-                       [[r["id"], r.get("vendor", ""), r["headroom"]["state"], r["headroom"]["used"], r.get("limit") or "-",
-                         r.get("window"), r["headroom"]["reset_at"] or "-", r.get("login", "")] for r in rows]) if rows else "no accounts")
+
+    out(a, rows, table(["ACCOUNT", "VENDOR", "AUTH", "STATE", "HEADROOM", "CHECKED", "$/MO", "LOGIN"],
+                       [[r["id"], r.get("vendor", ""), r.get("auth", "?"), auth_state(r) or r["headroom"]["state"], head_text(r["headroom"]),
+                         (r.get("check") or {}).get("at", "never")[:16], r.get("monthly_usd") or "-", r.get("login", "")] for r in rows]) if rows else "no accounts")
+
+
+def head_text(hr):
+    if not hr:
+        return "-"
+    lim = "%s/%s %s per %s" % (hr["used"], hr["limit"], hr["metric"], hr["window"]) if hr.get("limit") else "%s %s" % (hr["used"], hr["metric"])
+    return lim + (" (synced)" if hr.get("remote") else "")
 
 
 def cmd_hand(deck, a):
@@ -358,10 +653,12 @@ def cmd_hand(deck, a):
         if "cmd" not in rec:
             if rec["vendor"] not in VENDORS:
                 die("--cmd required for vendor %r (built-in templates: %s)" % (rec["vendor"], ", ".join(VENDORS)))
-            tpl, flag, cost = VENDORS[rec["vendor"]]
-            rec["cmd"] = tpl.format(model=" %s %s" % (flag, shlex.quote(rec["model"])) if rec.get("model") else "", prompt="{prompt}")
-            rec.setdefault("cost", cost)
+            v = VENDORS[rec["vendor"]]
+            rec["cmd"] = v["cmd"].format(model=" %s %s" % (v["flag"], shlex.quote(rec["model"])) if rec.get("model") else "", prompt="{prompt}")
+            rec.setdefault("cost", v["cost"])
         rec.setdefault("cost", "mid")
+        if a.price:
+            rec["price"] = parse_price(a.price)
         deck.save(rec, "hands", a.id + ".json")
         emit(deck, "HAND", hand=a.id, account=acct["id"], by=who(a))
         return out(a, rec, "hand %s saved -> %s\n  cmd: %s" % (a.id, acct["id"], rec["cmd"]))
@@ -382,11 +679,12 @@ def cmd_status(deck, a):
     rows = []
     for h in ro:
         hr, c = h["headroom"] or {}, h["claim"]
-        head = "-" if not hr else "%s/%s %s" % (hr["used"], hr["limit"], hr["metric"]) if hr.get("limit") else "%s %s" % (hr["used"], hr["metric"])
         note = ("by %s on %s" % (c["by"], c.get("task", "?")) if c else
+                "run: deck account login %s" % h.get("account") if h["state"] == "needs-login" else
+                "server down (deck account check %s)" % h.get("account") if h["state"] == "down" else
                 "until %s" % hr["cooldown_until"] if h["state"] == "cooldown" else
                 "resets in %s" % fdur((ts(hr["reset_at"]) - now()).total_seconds()) if hr.get("reset_at") else "")
-        rows.append([h["id"], h.get("account", ""), h.get("cost", ""), h["state"], head, note])
+        rows.append([h["id"], h.get("account", ""), h.get("cost", ""), h["state"], head_text(hr), note])
     print(table(["HAND", "ACCOUNT", "COST", "STATE", "HEADROOM", "NOTE"], rows) if rows else "no hands (deck hand add ...)")
     print("tasks: " + (", ".join("%s %d" % kv for kv in sorted(counts.items())) or "none"))
 
@@ -456,6 +754,11 @@ def cmd_run(deck, a):
     else:
         hand = None
         for cand in ranked:  # first claim that sticks wins; losing a race just means trying the next hand
+            if not auth_ok(deck, deck.load("accounts", cand["account"] + ".json")):
+                if a.hand:
+                    die("account %s needs login: deck account login %s" % (cand["account"], cand["account"]))
+                print("deck: skipping %s: account %s needs login" % (cand["id"], cand["account"]), file=sys.stderr)
+                continue
             try:
                 do_claim(deck, cand["id"], task["id"], by, a.ttl)
                 hand = cand
@@ -487,7 +790,7 @@ def cmd_run(deck, a):
     deck.save(task, "tasks", task["id"], "task.json")
     n = task["runs"]
     emit(deck, "START", task=task["id"], hand=hand["id"], by=by, run=n)
-    env = dict(os.environ, **{k: os.path.expanduser(str(v)) for k, v in acct.get("env", {}).items()})
+    env = dict(os.environ, **acct_env(acct))
     env.update(DECK_ROOT=str(deck.root), DECK_TASK=task["id"], DECK_HAND=hand["id"], DECK_CONTEXT=str(ctx), DECK_HANDOFF=str(hf))
     before, t0, msg = hf.stat().st_mtime if hf.exists() else 0, time.time(), None
     try:
@@ -503,16 +806,24 @@ def cmd_run(deck, a):
     secs = round(time.time() - t0)
     (tdir / "runs").mkdir(exist_ok=True)
     (tdir / "runs" / ("%d.log" % n)).write_text(output, encoding="utf-8")
-    usage = {k: (float if k == "cost_usd" else int)(sum(float(x) for x in re.findall(rx, output))) for k, rx in USAGE_RE.items()}
-    usage = {k: v for k, v in usage.items() if v}
+    usage, price = parse_usage(output), hand.get("price") or acct.get("price")
+    if price and not usage.get("cost_usd") and (usage.get("tokens_in") or usage.get("tokens_out")):
+        usage["cost_usd"] = round((usage.get("tokens_in", 0) * price.get("in", 0) + usage.get("tokens_out", 0) * price.get("out", 0)) / 1e6, 6)
     wrote = hf.exists() and hf.stat().st_mtime > before
     if wrote:
         status = parse_status(hf.read_text(encoding="utf-8"))
     elif code == 0:
         status = "END"
+    elif re.search(AUTH_FAIL_RE, output):
+        status, msg = "BLOCKED", "login needed on account %s: deck account login %s" % (acct["id"], acct["id"])
+        acct["check"] = {"ok": False, "at": iso(now()), "msg": "worker reported an auth failure"}
+        if acct.get("auth") == "apikey" and env.get(acct.get("key_env", "")):
+            acct["check"]["rejected"] = hashlib.sha256(env[acct["key_env"]].encode()).hexdigest()[:12]
+        deck.save(acct, "accounts", acct["id"] + ".json")
+        emit(deck, "AUTH", account=acct["id"], ok=False, by=by, msg=msg)
     elif re.search(RATE_LIMIT_RE, output):
         status, msg = "BLOCKED", "rate limited on account %s" % acct["id"]
-        acct["cooldown_until"] = iso(now() + dt.timedelta(seconds=dur(acct.get("cooldown", "1h"))))
+        acct["cooldown_until"] = iso(now() + dt.timedelta(seconds=dur(acct.get("cooldown") or ("5m" if acct.get("auth") == "apikey" else "1h"))))
         deck.save(acct, "accounts", acct["id"] + ".json")
         emit(deck, "COOLDOWN", account=acct["id"], until=acct["cooldown_until"], by=by, msg=msg)
     else:
@@ -561,9 +872,11 @@ def cmd_ledger(deck, a):
         t["runs"] += 1
         for k in ("units", "tokens_in", "tokens_out", "cost_usd", "seconds"):
             t[k] += r.get(k) or 0
-    out(a, {"rows": rows, "totals": list(tot.values())},
-        table(["ACCOUNT", "RUNS", "UNITS", "TOKENS IN", "TOKENS OUT", "COST USD", "TIME"],
-              [[t["account"], t["runs"], t["units"], t["tokens_in"], t["tokens_out"], "%.4f" % t["cost_usd"], fdur(t["seconds"])] for t in tot.values()]) if tot else "ledger empty")
+    subs = {x["id"]: x["monthly_usd"] for x in deck.items("accounts") if x.get("monthly_usd")}
+    out(a, {"rows": rows, "totals": list(tot.values()), "subscriptions_usd_per_month": subs},
+        (table(["ACCOUNT", "RUNS", "UNITS", "TOKENS IN", "TOKENS OUT", "API USD", "TIME"],
+               [[t["account"], t["runs"], t["units"], t["tokens_in"], t["tokens_out"], "%.4f" % t["cost_usd"], fdur(t["seconds"])] for t in tot.values()]) if tot else "ledger empty")
+        + ("\nsubscriptions: $%.2f/mo (%s)" % (sum(subs.values()), ", ".join("%s $%g" % kv for kv in subs.items())) if subs else ""))
 
 
 def cmd_events(deck, a):
@@ -610,9 +923,11 @@ MCP_TOOLS = [
     ("deck_handoff", "Close a task manually: write HANDOFF.md text and emit END or BLOCKED.", ["handoff"], {"task": None, "status": "--status", "text": "--text", "by": "--by"}, ["task"]),
     ("deck_events", "Recent events (decklog). n = count; type = comma list e.g. END,BLOCKED; since like 2h.", ["events"], {"n": "-n", "type": "--type", "since": "--since"}, []),
     ("deck_ledger", "Usage totals per account (runs, tokens, cost, time). account filter; since like 24h.", ["ledger"], {"account": "--account", "since": "--since"}, []),
-    ("deck_account_add", "Add/update an account. vendor: claude|codex|cursor|custom; login = pointer, never a secret; limit + window (5h) + metric (runs|tokens); env = KEY=VAL for per-account config dirs.", ["account", "add"], {"id": None, "vendor": "--vendor", "login": "--login", "limit": "--limit", "window": "--window", "metric": "--metric", "env": "--env"}, ["id"]),
+    ("deck_account_add", "Add/update an account (no secrets). vendor: claude|codex|cursor|gemini|ollama|lmstudio|custom; auth: oauth|apikey|none; limit like 200/5h; metric runs|tokens; price IN/OUT USD per 1M tokens; monthly_usd; env KEY=VAL. Afterwards a HUMAN must run `deck account login <id>` - never ask for a key in chat.", ["account", "add"], {"id": None, "vendor": "--vendor", "auth": "--auth", "limit": "--limit", "metric": "--metric", "price": "--price", "monthly_usd": "--monthly-usd", "login": "--login", "env": "--env", "base_url": "--base-url", "key_env": "--key-env"}, ["id"]),
+    ("deck_account_ls", "Accounts with auth state (needs-login / ok / cooldown / exhausted), headroom per window, subscription price.", ["account", "ls"], {}, []),
+    ("deck_account_check", "Re-check login / key presence / local server reachability for one account or all. Emits AUTH when state changes. Never returns secrets.", ["account", "check"], {"id": None}, []),
     ("deck_account_cooldown", "Mark an account exhausted for a duration (e.g. 2h), or clear=true to lift it.", ["account", "cooldown"], {"id": None, "for": "--for", "clear": "--clear!"}, ["id"]),
-    ("deck_hand_add", "Add/update a hand preset bound to an account. model, cost (low|mid|high), cmd (shell with {prompt}/{context}/{handoff}); cmd defaults from vendor template.", ["hand", "add"], {"id": None, "account": "--account", "vendor": "--vendor", "model": "--model", "cost": "--cost", "cmd": "--cmd"}, ["id"]),
+    ("deck_hand_add", "Add/update a hand preset bound to an account. model, cost (free|low|mid|high), price IN/OUT per 1M tokens, cmd (shell with {prompt}/{context}/{handoff}); cmd defaults from the vendor template.", ["hand", "add"], {"id": None, "account": "--account", "vendor": "--vendor", "model": "--model", "cost": "--cost", "price": "--price", "cmd": "--cmd"}, ["id"]),
     ("deck_usage_add", "Record usage on an account by hand (for workers not run via deck run).", ["usage", "add"], {"account": "--account", "hand": "--hand", "task": "--task", "units": "--units", "tokens_in": "--tokens-in", "tokens_out": "--tokens-out", "cost_usd": "--cost-usd"}, ["account"]),
 ]
 
@@ -687,20 +1002,34 @@ def build_parser():
     p = sp("init", cmd_init, "create .deck/ here (idempotent)")
     p.add_argument("path", nargs="?"), p.add_argument("--name")
 
-    s = group("account", "accounts: add | ls | rm | cooldown")
-    q = sp("add", cmd_account, "add or update an account", s)
-    q.add_argument("id"), q.add_argument("--vendor", help="claude|codex|cursor|custom"), q.add_argument("--login", help="how it's logged in (pointer, never a secret)")
-    q.add_argument("--limit", type=int, help="units per window (0 = unlimited)"), q.add_argument("--window", help="rate window, e.g. 5h (default)"), q.add_argument("--metric", choices=("runs", "tokens"))
-    q.add_argument("--env", action="append", help="KEY=VAL applied when hands on this account run (repeatable)"), q.add_argument("--notes")
-    sp("ls", cmd_account, "list accounts with headroom", s)
-    sp("rm", cmd_account, "remove an account", s).add_argument("id")
+    s = group("account", "accounts: add | login | check | ls | logout | sync | cooldown | rm")
+    q = sp("add", cmd_account, "add or update an account (then: deck account login <id>)", s)
+    q.add_argument("id"), q.add_argument("--vendor", help="|".join(list(VENDORS) + ["custom"]))
+    q.add_argument("--auth", choices=("oauth", "apikey", "none"), help="default: oauth if the vendor CLI has a login, else apikey")
+    q.add_argument("--home", help="login dir for oauth (default %s/<id>; 'default' = the vendor's usual dir)" % HOMES)
+    q.add_argument("--key-env", help="env var the CLI reads the API key from (custom vendors)"), q.add_argument("--base-url", help="local server URL")
+    q.add_argument("--limit", action="append", help="N/WINDOW e.g. 200/5h, repeatable (N alone = per 5h; 0 clears)"), q.add_argument("--metric", choices=("runs", "tokens"))
+    q.add_argument("--price", help="USD per 1M tokens IN/OUT, e.g. 3/15 (API accounts)"), q.add_argument("--monthly-usd", type=float, help="subscription price, informational")
+    q.add_argument("--env", action="append", help="KEY=VAL applied when hands on this account run (repeatable)")
+    q.add_argument("--login", help="who/where this is logged in (pointer, never a secret)"), q.add_argument("--usage-cmd", help="command printing JSON {used, limit, window?, reset_at?} for `deck account sync`")
+    q.add_argument("--status-cmd", help="override the vendor's login-status command (exit 0 = logged in)"), q.add_argument("--login-cmd", help="override the vendor's login command"), q.add_argument("--notes")
+    q.add_argument("--now", dest="login_now", action="store_true", help="run the login flow right after saving")
+    q.add_argument("--headless", action="store_true", help="with --now: device-code / no-browser flow"), q.add_argument("--from-env"), q.add_argument("--from-file")
+    q = sp("login", cmd_account, "human step: vendor login (browser/device code) or API key into the OS keychain", s)
+    q.add_argument("id"), q.add_argument("--headless", action="store_true", help="no browser here: device code / paste-URL flow")
+    q.add_argument("--from-env", help="apikey: read the key from this env var"), q.add_argument("--from-file", help="apikey: read the key from this file, then delete it")
+    sp("check", cmd_account, "refresh auth/reachability state (never prints secrets)", s).add_argument("id", nargs="?")
+    sp("ls", cmd_account, "list accounts with auth state and headroom", s)
+    sp("logout", cmd_account, "drop the login / delete the stored key", s).add_argument("id")
+    sp("sync", cmd_account, "run usage_cmd and store the vendor's own usage numbers", s).add_argument("id")
+    sp("rm", cmd_account, "remove an account record", s).add_argument("id")
     q = sp("cooldown", cmd_account, "mark exhausted for a while", s)
     q.add_argument("id"), q.add_argument("--for", dest="for_", help="duration, e.g. 2h (default 1h)"), q.add_argument("--until", help="ISO time"), q.add_argument("--clear", action="store_true")
 
     s = group("hand", "hands: add | ls | rm")
     q = sp("add", cmd_hand, "add or update a hand preset", s)
     q.add_argument("id"), q.add_argument("--account"), q.add_argument("--vendor"), q.add_argument("--model"), q.add_argument("--cost", choices=COSTS)
-    q.add_argument("--cmd", help="shell command; placeholders {prompt} {context} {handoff} {task}"), q.add_argument("--notes")
+    q.add_argument("--cmd", help="shell command; placeholders {prompt} {context} {handoff} {task}"), q.add_argument("--price", help="USD per 1M tokens IN/OUT, e.g. 3/15"), q.add_argument("--notes")
     sp("ls", cmd_hand, "list hands", s)
     sp("rm", cmd_hand, "remove a hand", s).add_argument("id")
 
