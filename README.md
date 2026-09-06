@@ -5,7 +5,7 @@
 Agent Deck is a thin, open protocol that lets any meta-agent (Cos, OpenClaw, a Grok bot, a human) drive
 your coding agents (Claude Code, Codex, Cursor, anything with a CLI) as *hands*: see which accounts have
 headroom, dispatch a task to the right hand, and get woken when it ends or blocks. It is a directory of
-JSON + Markdown files, one 700-line zero-dependency CLI, and an optional MCP mirror. No daemon, no
+JSON + Markdown files, one ~750-line zero-dependency CLI, and an optional MCP mirror. No daemon, no
 database, no cloud.
 
 ```
@@ -98,6 +98,31 @@ deck account cooldown claude-work --for 3h      # or let a rate-limit BLOCKED do
   Tools: `deck_status`, `deck_route`, `deck_task_add`, `deck_task_ls`, `deck_task_show`, `deck_run`,
   `deck_handoff`, `deck_events`, `deck_ledger`, `deck_account_add`, `deck_account_cooldown`,
   `deck_hand_add`, `deck_usage_add`. Each is a 1:1 mirror of a CLI command.
+
+## Vendor templates
+
+`deck hand add --vendor X` seeds `cmd` from these (verified against Claude Code 2.1, codex-cli 0.153,
+cursor-agent 2026.09). Edit `hands/<id>.json` freely; deck only cares about the placeholders.
+
+| vendor | cmd |
+|---|---|
+| claude | `claude -p --permission-mode acceptEdits --output-format json --model M {prompt}` |
+| codex  | `codex exec --sandbox workspace-write --skip-git-repo-check --json -m M {prompt}` |
+| cursor | `cursor-agent -p --force --output-format json --model M {prompt}` |
+
+Token parsing reads `"input_tokens"`, `"output_tokens"`, `"total_cost_usd"` from the JSON output
+(Claude's single result object; Codex's `turn.completed` event). When a vendor emits no usage, the
+ledger row still carries `units` and `seconds`; add tokens by hand with `deck usage add`.
+
+## Testing
+
+```bash
+bash tests/smoke.sh      # end-to-end with fake hands; no vendor CLIs or credentials needed
+```
+
+Covers routing, claims under contention, END/BLOCKED/FAILED, rate-limit cooldown, timeouts, oversize
+prompts, bad cwd, hooks, torn log lines, corrupt records, token-metric headroom, and an MCP round trip.
+Passes on Python 3.8 and 3.12.
 
 ## Anti-bloat rules
 

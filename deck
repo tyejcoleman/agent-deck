@@ -23,7 +23,7 @@ COSTS = ("low", "mid", "high")
 # vendor: (command template, model flag, default cost). Templates are a starting point; edit hands/<id>.json freely.
 VENDORS = {
     "claude": ("claude -p --permission-mode acceptEdits --output-format json{model} {prompt}", "--model", "high"),
-    "codex": ("codex exec --full-auto --json{model} {prompt}", "-m", "mid"),
+    "codex": ("codex exec --sandbox workspace-write --skip-git-repo-check --json{model} {prompt}", "-m", "mid"),
     "cursor": ("cursor-agent -p --force --output-format json{model} {prompt}", "--model", "mid"),
 }
 USAGE_RE = {"tokens_in": r'"input_tokens":\s*(\d+)', "tokens_out": r'"output_tokens":\s*(\d+)', "cost_usd": r'"total_cost_usd":\s*([\d.]+)'}
@@ -122,7 +122,7 @@ def read_text_arg(a):
     f = getattr(a, "file", None)
     if f == "-":
         return sys.stdin.read()
-    return Path(f).read_text() if f else None
+    return Path(f).read_text(encoding="utf-8") if f else None
 
 
 def parse_status(text):
@@ -131,13 +131,22 @@ def parse_status(text):
 
 
 def result_text(output, lines=40):
-    try:
-        obj = json.loads(output)
-        if isinstance(obj, dict) and isinstance(obj.get("result"), str):
-            return obj["result"]
-    except ValueError:
-        pass
-    return "\n".join(output.strip().splitlines()[-lines:])
+    """Best-effort final message: Claude json `result`, Codex JSONL last agent_message, else the tail."""
+    final = None
+    for line in output.strip().splitlines():
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            item = obj.get("item") or {}
+            if isinstance(obj.get("result"), str):
+                final = obj["result"]
+            elif item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+                final = item["text"]
+            elif isinstance(obj.get("error"), dict) and obj["error"].get("message"):
+                final = "error: %s" % obj["error"]["message"]
+    return final or "\n".join(output.strip().splitlines()[-lines:])
 
 
 # ---------- deck ----------
@@ -162,25 +171,40 @@ class Deck:
         f = self.p(*parts)
         if not f.exists():
             die("not found: %s" % f.relative_to(self.root))
-        return json.loads(f.read_text())
+        return self.parse(f)
+
+    def parse(self, f):
+        try:
+            obj = json.loads(f.read_text(encoding="utf-8"))
+            if not isinstance(obj, dict):
+                raise ValueError("expected a JSON object")
+            return obj
+        except ValueError as e:
+            die("bad JSON in %s: %s" % (f.relative_to(self.root), e))
 
     def save(self, obj, *parts):
         f = self.p(*parts)
         f.parent.mkdir(parents=True, exist_ok=True)
-        tmp = f.with_suffix(".tmp")
-        tmp.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n")
+        tmp = f.with_name("%s.%d.tmp" % (f.name, os.getpid()))
+        tmp.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(tmp, f)
 
     def items(self, kind):
         pat = "*/task.json" if kind == "tasks" else "*.json"
-        return sorted((json.loads(f.read_text()) for f in self.p(kind).glob(pat)), key=lambda o: o["id"])
+        return sorted((self.parse(f) for f in self.p(kind).glob(pat)), key=lambda o: o.get("id", ""))
 
     def rows(self, name):
         f = self.p(name)
-        return [json.loads(l) for l in f.read_text().splitlines() if l.strip()] if f.exists() else []
+        rows = []
+        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines() if f.exists() else []):
+            try:
+                rows.append(json.loads(line)) if line.strip() else None
+            except ValueError:  # a torn line must not take the whole deck down
+                print("deck: skipping bad line %d in %s" % (i + 1, name), file=sys.stderr)
+        return rows
 
     def append(self, name, row):
-        with open(str(self.p(name)), "a") as fh:
+        with open(str(self.p(name)), "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")
 
 
@@ -217,7 +241,7 @@ def claim_of(deck, hand):
     f = deck.p("claims", hand + ".json")
     if not f.exists():
         return None
-    c = json.loads(f.read_text())
+    c = deck.parse(f)
     return c if not c.get("until") or ts(c["until"]) > now() else None
 
 
@@ -253,7 +277,7 @@ def do_claim(deck, hand, task, by, ttl):
         fd = os.open(str(f), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
     except FileExistsError:
         die("hand %s was just claimed by someone else" % hand)
-    with os.fdopen(fd, "w") as fh:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(rec, fh, indent=2)
     emit(deck, "CLAIM", hand=hand, task=task, by=by)
     return rec
@@ -285,14 +309,14 @@ def cmd_init(a):
         Deck(root).save({"version": 1, "name": a.name or root.parent.name}, "deck.json")
     for f in ("events.jsonl", "ledger.jsonl"):
         (root / f).touch()
-    (root / "AGENTS.md").write_text(AGENTS_MD)
+    (root / "AGENTS.md").write_text(AGENTS_MD, encoding="utf-8")
     out(a, {"deck": str(root)}, "deck ready: %s\nnext: deck account add <id> --vendor claude|codex|cursor\n      deck hand add <id> --account <id> [--model M]" % root)
 
 
 def cmd_account(deck, a):
     if a.sub == "add":
         f = deck.p("accounts", a.id + ".json")
-        rec = dict(json.loads(f.read_text()) if f.exists() else {}, id=a.id)
+        rec = dict(deck.parse(f) if f.exists() else {}, id=a.id)
         for k in ("vendor", "login", "window", "metric", "notes"):
             if getattr(a, k) is not None:
                 rec[k] = getattr(a, k)
@@ -325,7 +349,7 @@ def cmd_account(deck, a):
 def cmd_hand(deck, a):
     if a.sub == "add":
         f = deck.p("hands", a.id + ".json")
-        rec = dict(json.loads(f.read_text()) if f.exists() else {}, id=a.id)
+        rec = dict(deck.parse(f) if f.exists() else {}, id=a.id)
         acct = deck.load("accounts", (a.account or rec.get("account") or die("--account required")) + ".json")
         rec["account"], rec["vendor"] = acct["id"], a.vendor or rec.get("vendor") or acct.get("vendor")
         for k in ("model", "cost", "cmd", "notes"):
@@ -386,13 +410,13 @@ def cmd_task(deck, a):
         if a.cwd:
             rec["cwd"] = str(Path(a.cwd).resolve())
         deck.save(rec, "tasks", tid, "task.json")
-        deck.p("tasks", tid, "CONTEXT.md").write_text(read_text_arg(a) or CONTEXT_MD.format(title=a.title))
+        deck.p("tasks", tid, "CONTEXT.md").write_text(read_text_arg(a) or CONTEXT_MD.format(title=a.title), encoding="utf-8")
         emit(deck, "TASK", task=tid, by=who(a), msg=a.title)
         return out(a, rec, tid)
     if a.sub == "show":
         t = deck.load("tasks", a.id, "task.json")
         ctx, hf = (deck.p("tasks", a.id, n) for n in ("CONTEXT.md", "HANDOFF.md"))
-        t["context"], t["handoff"] = (f.read_text() if f.exists() else None for f in (ctx, hf))
+        t["context"], t["handoff"] = (f.read_text(encoding="utf-8") if f.exists() else None for f in (ctx, hf))
         return out(a, t, "%s\n\n--- CONTEXT.md ---\n%s\n--- HANDOFF.md ---\n%s" % (json.dumps({k: v for k, v in t.items() if k not in ("context", "handoff")}, indent=2), t["context"] or "", t["handoff"] or "(none)"))
     if a.sub == "set":
         t = deck.load("tasks", a.id, "task.json")
@@ -423,29 +447,42 @@ def cmd_run(deck, a):
     if task["status"] == "running" and not a.force:
         die("task %s is already running (use --force)" % a.task)
     by = who(a)
-    if a.hand:
-        hand = deck.load("hands", a.hand + ".json")
-    else:
-        ranked = route(deck, a.cost or task.get("cost"), a.vendor)
+    ranked = [deck.load("hands", a.hand + ".json")] if a.hand else route(deck, a.cost or task.get("cost"), a.vendor)
+    if a.dry:
         if not ranked:
+            out(a, {"status": "BLOCKED", "msg": "no free hand"}, "no free hand")
+            return 2
+        hand = ranked[0]
+    else:
+        hand = None
+        for cand in ranked:  # first claim that sticks wins; losing a race just means trying the next hand
+            try:
+                do_claim(deck, cand["id"], task["id"], by, a.ttl)
+                hand = cand
+                break
+            except SystemExit as e:
+                if a.hand:
+                    raise
+                print(str(e), file=sys.stderr)
+        if not hand:
             resets = [h["headroom"].get("cooldown_until") or h["headroom"].get("reset_at") for h in roster(deck) if h["headroom"]]
             msg = "no free hand" + ("; earliest reset %s" % min(r for r in resets if r) if any(resets) else "")
             task.pop("hand", None)
             finish(deck, task, "BLOCKED", by, msg=msg)
             out(a, {"status": "BLOCKED", "msg": msg}, "BLOCKED: " + msg)
             return 2
-        hand = ranked[0]
     acct = deck.load("accounts", hand["account"] + ".json")
     tdir = deck.p("tasks", task["id"])
     ctx, hf = tdir / "CONTEXT.md", tdir / "HANDOFF.md"
-    prompt = PROMPT.format(id=task["id"], title=task["title"], handoff=hf, context=ctx.read_text() if ctx.exists() else task["title"])
+    prompt = PROMPT.format(id=task["id"], title=task["title"], handoff=hf, context=ctx.read_text(encoding="utf-8") if ctx.exists() else task["title"])
     cmd = hand["cmd"].replace("{context}", shlex.quote(str(ctx))).replace("{handoff}", shlex.quote(str(hf))).replace("{task}", task["id"])
+    if len(prompt) > 100000:  # Linux caps a single argv string at 128KB; every vendor CLI also reads the prompt from stdin
+        cmd = re.sub(r"\s*\{prompt\}", "", cmd)
     stdin = None if "{prompt}" in cmd else prompt
     cmd = cmd.replace("{prompt}", shlex.quote(prompt))
     cwd = a.cwd or task.get("cwd") or str(deck.root.parent)
     if a.dry:
         return out(a, {"hand": hand["id"], "cwd": cwd, "cmd": cmd, "stdin": stdin}, "hand: %s\ncwd:  %s\ncmd:  %s%s" % (hand["id"], cwd, cmd, "\n--- stdin ---\n" + stdin if stdin else ""))
-    do_claim(deck, hand["id"], task["id"], by, a.ttl)
     task.update(status="running", hand=hand["id"], runs=task.get("runs", 0) + 1)
     deck.save(task, "tasks", task["id"], "task.json")
     n = task["runs"]
@@ -454,20 +491,23 @@ def cmd_run(deck, a):
     env.update(DECK_ROOT=str(deck.root), DECK_TASK=task["id"], DECK_HAND=hand["id"], DECK_CONTEXT=str(ctx), DECK_HANDOFF=str(hf))
     before, t0, msg = hf.stat().st_mtime if hf.exists() else 0, time.time(), None
     try:
-        p = subprocess.run(cmd, shell=True, cwd=cwd, input=stdin, capture_output=True, text=True, env=env,
-                           timeout=dur(a.timeout) if a.timeout else None)
+        p = subprocess.run(cmd, shell=True, cwd=cwd, input=stdin, capture_output=True, env=env,
+                           encoding="utf-8", errors="replace", timeout=dur(a.timeout) if a.timeout else None)
         output, code = (p.stdout or "") + (p.stderr or ""), p.returncode
     except subprocess.TimeoutExpired as e:
-        output, code = (e.stdout or "") + (e.stderr or "") + "\n[deck] timeout after %s" % a.timeout, 124
+        dec = lambda b: b.decode("utf-8", "replace") if isinstance(b, bytes) else (b or "")
+        output, code = dec(e.stdout) + dec(e.stderr) + "\n[deck] timeout after %s" % a.timeout, 124
         msg = "timeout after %s" % a.timeout
+    except OSError as e:  # bad cwd, argv too long, etc. Must still release the claim and close the task.
+        output, code, msg = "[deck] could not start worker: %s" % e, 126, "could not start worker: %s" % e
     secs = round(time.time() - t0)
     (tdir / "runs").mkdir(exist_ok=True)
-    (tdir / "runs" / ("%d.log" % n)).write_text(output)
+    (tdir / "runs" / ("%d.log" % n)).write_text(output, encoding="utf-8")
     usage = {k: (float if k == "cost_usd" else int)(sum(float(x) for x in re.findall(rx, output))) for k, rx in USAGE_RE.items()}
     usage = {k: v for k, v in usage.items() if v}
     wrote = hf.exists() and hf.stat().st_mtime > before
     if wrote:
-        status = parse_status(hf.read_text())
+        status = parse_status(hf.read_text(encoding="utf-8"))
     elif code == 0:
         status = "END"
     elif re.search(RATE_LIMIT_RE, output):
@@ -479,7 +519,7 @@ def cmd_run(deck, a):
         status, msg = "FAILED", msg or "exit %d" % code
     if not wrote:
         hf.write_text(HANDOFF_MD.format(status="%s (auto: worker exited %d without writing a handoff)" % (status, code),
-                                        body="Output tail:\n\n```\n%s\n```" % result_text(output)))
+                                        body="Output tail:\n\n```\n%s\n```" % result_text(output)), encoding="utf-8")
     deck.append("ledger.jsonl", dict({"ts": iso(now()), "account": acct["id"], "hand": hand["id"], "task": task["id"], "run": n,
                                       "units": 1, "seconds": secs, "exit": code}, **usage))
     ev = finish(deck, task, status, by, run=n, seconds=secs, exit=code, msg=msg, **usage)
@@ -495,10 +535,10 @@ def cmd_handoff(deck, a):
     if a.text:
         text = HANDOFF_MD.format(status=a.status or "END", body=a.text)
     if text:
-        hf.write_text(text)
+        hf.write_text(text, encoding="utf-8")
     if not hf.exists():
         die("no HANDOFF.md for %s; pass --text or --file" % a.task)
-    status = a.status or parse_status(hf.read_text())
+    status = a.status or parse_status(hf.read_text(encoding="utf-8"))
     ev = finish(deck, task, status, who(a), msg=a.text and a.text[:200])
     out(a, ev, "%s %s" % (status, a.task))
 
@@ -541,7 +581,7 @@ def cmd_events(deck, a):
         print(fmt(e), flush=True)
     if not a.follow:
         return
-    with open(str(f)) as fh:
+    with open(str(f), encoding="utf-8") as fh:
         fh.seek(0, 2)
         while True:
             line = fh.readline()

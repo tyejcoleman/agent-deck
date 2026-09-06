@@ -42,8 +42,9 @@ in the trailing `window` (from LEDGER). `cooldown_until` marks the account exhau
 
 **HAND** — `{"id", "vendor", "account", "model", "cost": "low|mid|high", "cmd"}`. `cmd` is a shell
 string. Placeholders: `{prompt}` (shell-quoted), `{context}`, `{handoff}` (absolute paths), `{task}`.
-If `{prompt}` is absent, the prompt is piped to stdin. Reusable presets, not a registry: delete any
-hand nobody uses.
+If `{prompt}` is absent, or the prompt exceeds 100KB (Linux caps one argv string at 128KB), the prompt
+is piped to stdin instead — `claude -p`, `codex exec`, and `cursor-agent -p` all read it from there.
+Reusable presets, not a registry: delete any hand nobody uses.
 
 **TASK** — `{"id", "title", "status": "open|running|done|blocked|failed", "cost", "cwd", "hand",
 "runs", "created"}`. `cost` is a routing preference. `cwd` is where the worker runs (default: the
@@ -77,7 +78,9 @@ meta: wake on the event  →  read HANDOFF.md → steer: new task, re-run, or st
 The worker is told (in its prompt and via `$DECK_CONTEXT`, `$DECK_HANDOFF`, `$DECK_TASK`) to write
 HANDOFF.md before exiting. If it doesn't, `deck run` writes a stub from the output tail so the
 meta-agent always has something to read. Exit `0` without a handoff is `END`; non-zero is `FAILED`;
-non-zero with rate-limit text in the output is `BLOCKED` and puts the account on cooldown.
+non-zero with rate-limit text in the output is `BLOCKED` and puts the account on cooldown. A worker
+that cannot start (bad `cwd`, missing binary, timeout) is `FAILED` too. In every case the claim is
+released and the task leaves `running` — a run never leaves the deck half-updated.
 
 Workers driven by hand (interactive Claude Code, a human) close the loop with
 `deck handoff <task> --status END --text "…"`.
@@ -90,7 +93,8 @@ Workers driven by hand (interactive Claude Code, a human) close the loop with
 2. sort by cost-class distance from the requested `cost`, then most remaining headroom fraction,
    then least recently used.
 
-`deck run` takes the first. No free hand → `BLOCKED` event with the earliest reset time. Anyone can
+`deck run` claims the first hand whose claim sticks (losing a race to another meta-agent just means
+trying the next one). No free hand → `BLOCKED` event with the earliest reset time. Anyone can
 implement a different policy by reading the same files; the CLI's version is ~20 lines.
 
 ## 5. Wake
