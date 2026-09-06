@@ -62,7 +62,8 @@ joins the comparison when fresher than an hour. `price` (USD per 1M tokens) comp
 runs whose vendor reports tokens but no cost. `monthly_usd` is informational (shown in `deck ledger`).
 
 **HAND** — `{"id", "vendor", "account", "model", "cost": "low|mid|high", "cmd"}`. `cmd` is a shell
-string. Placeholders: `{prompt}` (shell-quoted), `{context}`, `{handoff}` (absolute paths), `{task}`.
+string. Placeholders: `{prompt}` (shell-quoted), `{context}`, `{handoff}`, `{taskdir}` (absolute paths), `{task}`.
+Templates pass `--add-dir {taskdir}` so the worker may write HANDOFF.md outside the repo without a prompt.
 If `{prompt}` is absent, or the prompt exceeds 100KB (Linux caps one argv string at 128KB), the prompt
 is piped to stdin instead — `claude -p`, `codex exec`, and `cursor-agent -p` all read it from there.
 Reusable presets, not a registry: delete any hand nobody uses.

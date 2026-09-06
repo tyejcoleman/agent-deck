@@ -31,22 +31,22 @@ SECRETS = "~/.config/deck/secrets"  # 0600 files, used only when no keychain/lib
 # none (local servers; `base_url` + `health`). cmd/flag/cost seed hands; edit hands/<id>.json freely.
 VENDORS = {
     "claude": dict(home="CLAUDE_CONFIG_DIR", key="ANTHROPIC_API_KEY", login="claude auth login", status="claude auth status",
-                   logout="claude auth logout", cmd="claude -p --permission-mode acceptEdits --output-format json{model} {prompt}",
+                   logout="claude auth logout", cmd="claude -p --add-dir {taskdir} --permission-mode acceptEdits --output-format json{model} {prompt}",
                    flag="--model", cost="high"),
     "codex": dict(home="CODEX_HOME", key="OPENAI_API_KEY", login="codex login", headless="codex login --device-auth",
                   status="codex login status", logout="codex logout",
-                  cmd="codex exec --sandbox workspace-write --skip-git-repo-check --json{model} {prompt}", flag="-m", cost="mid"),
+                  cmd="codex exec --sandbox workspace-write --add-dir {taskdir} --skip-git-repo-check --json{model} {prompt}", flag="-m", cost="mid"),
     "cursor": dict(home="CURSOR_CONFIG_DIR", key="CURSOR_API_KEY", login="cursor-agent login", headless_env={"NO_OPEN_BROWSER": "1"},
                    status="cursor-agent status", logout="cursor-agent logout",
-                   cmd="cursor-agent -p --force --output-format json{model} {prompt}", flag="--model", cost="mid"),
+                   cmd="cursor-agent -p --force --add-dir {taskdir} --output-format json{model} {prompt}", flag="--model", cost="mid"),
     "gemini": dict(home="GEMINI_CLI_HOME", key="GEMINI_API_KEY", login="gemini", headless_env={"NO_BROWSER": "true"},
                    status="file:.gemini/oauth_creds.json", login_hint="pick 'Login with Google', finish in the browser, then /quit",
-                   cmd="gemini -p {prompt} --approval-mode yolo --output-format json{model}", flag="-m", cost="low"),
+                   cmd="gemini -p {prompt} --include-directories {taskdir} --approval-mode yolo --output-format json{model}", flag="-m", cost="low"),
     "ollama": dict(base_url="http://localhost:11434", health="/api/tags", env={"OLLAMA_HOST": "{base_url}"},
-                   cmd="codex exec --oss --local-provider ollama --sandbox workspace-write --skip-git-repo-check --json{model} {prompt}",
+                   cmd="codex exec --oss --local-provider ollama --sandbox workspace-write --add-dir {taskdir} --skip-git-repo-check --json{model} {prompt}",
                    flag="-m", cost="free"),
     "lmstudio": dict(base_url="http://localhost:1234", health="/v1/models",
-                     cmd="codex exec --oss --local-provider lmstudio --sandbox workspace-write --skip-git-repo-check --json{model} {prompt}",
+                     cmd="codex exec --oss --local-provider lmstudio --sandbox workspace-write --add-dir {taskdir} --skip-git-repo-check --json{model} {prompt}",
                      flag="-m", cost="free"),
 }
 RATE_LIMIT_RE = r"(?i)rate.?limit|usage limit|hit your limit|quota exceeded|too many requests|\b429\b"
@@ -654,7 +654,7 @@ def cmd_hand(deck, a):
             if rec["vendor"] not in VENDORS:
                 die("--cmd required for vendor %r (built-in templates: %s)" % (rec["vendor"], ", ".join(VENDORS)))
             v = VENDORS[rec["vendor"]]
-            rec["cmd"] = v["cmd"].format(model=" %s %s" % (v["flag"], shlex.quote(rec["model"])) if rec.get("model") else "", prompt="{prompt}")
+            rec["cmd"] = v["cmd"].format(model=" %s %s" % (v["flag"], shlex.quote(rec["model"])) if rec.get("model") else "", prompt="{prompt}", taskdir="{taskdir}")
             rec.setdefault("cost", v["cost"])
         rec.setdefault("cost", "mid")
         if a.price:
@@ -778,7 +778,8 @@ def cmd_run(deck, a):
     tdir = deck.p("tasks", task["id"])
     ctx, hf = tdir / "CONTEXT.md", tdir / "HANDOFF.md"
     prompt = PROMPT.format(id=task["id"], title=task["title"], handoff=hf, context=ctx.read_text(encoding="utf-8") if ctx.exists() else task["title"])
-    cmd = hand["cmd"].replace("{context}", shlex.quote(str(ctx))).replace("{handoff}", shlex.quote(str(hf))).replace("{task}", task["id"])
+    cmd = (hand["cmd"].replace("{context}", shlex.quote(str(ctx))).replace("{handoff}", shlex.quote(str(hf)))
+           .replace("{taskdir}", shlex.quote(str(tdir))).replace("{task}", task["id"]))
     if len(prompt) > 100000:  # Linux caps a single argv string at 128KB; every vendor CLI also reads the prompt from stdin
         cmd = re.sub(r"\s*\{prompt\}", "", cmd)
     stdin = None if "{prompt}" in cmd else prompt
@@ -927,7 +928,7 @@ MCP_TOOLS = [
     ("deck_account_ls", "Accounts with auth state (needs-login / ok / cooldown / exhausted), headroom per window, subscription price.", ["account", "ls"], {}, []),
     ("deck_account_check", "Re-check login / key presence / local server reachability for one account or all. Emits AUTH when state changes. Never returns secrets.", ["account", "check"], {"id": None}, []),
     ("deck_account_cooldown", "Mark an account exhausted for a duration (e.g. 2h), or clear=true to lift it.", ["account", "cooldown"], {"id": None, "for": "--for", "clear": "--clear!"}, ["id"]),
-    ("deck_hand_add", "Add/update a hand preset bound to an account. model, cost (free|low|mid|high), price IN/OUT per 1M tokens, cmd (shell with {prompt}/{context}/{handoff}); cmd defaults from the vendor template.", ["hand", "add"], {"id": None, "account": "--account", "vendor": "--vendor", "model": "--model", "cost": "--cost", "price": "--price", "cmd": "--cmd"}, ["id"]),
+    ("deck_hand_add", "Add/update a hand preset bound to an account. model, cost (free|low|mid|high), price IN/OUT per 1M tokens, cmd (shell with {prompt}/{context}/{handoff}/{taskdir}); cmd defaults from the vendor template.", ["hand", "add"], {"id": None, "account": "--account", "vendor": "--vendor", "model": "--model", "cost": "--cost", "price": "--price", "cmd": "--cmd"}, ["id"]),
     ("deck_usage_add", "Record usage on an account by hand (for workers not run via deck run).", ["usage", "add"], {"account": "--account", "hand": "--hand", "task": "--task", "units": "--units", "tokens_in": "--tokens-in", "tokens_out": "--tokens-out", "cost_usd": "--cost-usd"}, ["account"]),
 ]
 
@@ -1029,7 +1030,7 @@ def build_parser():
     s = group("hand", "hands: add | ls | rm")
     q = sp("add", cmd_hand, "add or update a hand preset", s)
     q.add_argument("id"), q.add_argument("--account"), q.add_argument("--vendor"), q.add_argument("--model"), q.add_argument("--cost", choices=COSTS)
-    q.add_argument("--cmd", help="shell command; placeholders {prompt} {context} {handoff} {task}"), q.add_argument("--price", help="USD per 1M tokens IN/OUT, e.g. 3/15"), q.add_argument("--notes")
+    q.add_argument("--cmd", help="shell command; placeholders {prompt} {context} {handoff} {taskdir} {task}"), q.add_argument("--price", help="USD per 1M tokens IN/OUT, e.g. 3/15"), q.add_argument("--notes")
     sp("ls", cmd_hand, "list hands", s)
     sp("rm", cmd_hand, "remove a hand", s).add_argument("id")
 
