@@ -117,7 +117,7 @@ grep -q '"type": "AUTH", "account": "oa", "ok": true' .deck/events.jsonl && grep
 export SMOKE_KEY="sk-test-abcdef"
 deck account add api --vendor custom --auth apikey --key-env SMOKE_API_KEY --price 3/15 >/dev/null
 deck account login api --from-env SMOKE_KEY >/dev/null
-[ "$(stat -c %a "$HOME/.config/deck/secrets/api")" = 600 ] && ! grep -rq "sk-test" .deck && pass "apikey stored 0600 outside .deck" || fail "apikey storage"
+[ "$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$HOME/.config/deck/secrets/api")" = 0o600 ] && ! grep -rq "sk-test" .deck && pass "apikey stored 0600 outside .deck" || fail "apikey storage"
 deck hand add apih --account api --cost low --cmd 'sh -c "cat >/dev/null; [ \${#SMOKE_API_KEY} = 14 ] || exit 9; echo {\\\"usage\\\":{\\\"input_tokens\\\":1000000,\\\"output_tokens\\\":100000}}"' >/dev/null
 deck task add "api" --id t13 >/dev/null; expect 0 deck run t13 --hand apih
 grep -q '"cost_usd": 4.5' .deck/ledger.jsonl && ! grep -rq "sk-test" .deck && pass "key injected into worker; cost from price" || fail "key injection / cost"
