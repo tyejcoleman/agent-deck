@@ -1,0 +1,6 @@
+{
+  "snapshot": "default",
+  "install": "sh install.sh && npm i -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli && (curl -fsSL https://cursor.com/install | bash || true) && bash tests/smoke.sh",
+  "start": "",
+  "terminals": []
+}

@@ -6,7 +6,7 @@ Agent Deck is a thin, open protocol that lets any meta-agent (Cos, OpenClaw, a G
 your coding agents (Claude Code, Codex, Cursor, Gemini CLI, local models, anything with a CLI) as
 *hands*: connect every subscription and API account you have once, see which one has headroom right
 now, dispatch a task to the right hand, and get woken when it ends, blocks, or needs you to log in
-again. It is a directory of JSON + Markdown files, one zero-dependency Python file (~1400 lines), and an optional
+again. It is a directory of JSON + Markdown files, one zero-dependency Python file (~1800 lines), and an optional
 MCP mirror. No daemon, no database, no cloud.
 
 ```
@@ -114,6 +114,22 @@ A runner that dies is reaped to `failed` by the next `status`, so nothing stays 
 or sequential is the meta-agent's call, made from headroom: `deck status` shows `% of window` for
 subscriptions, `$ in window` for API accounts, tokens for local models.
 
+## What the dollars mean (and when they don't)
+
+Researched 2026-09-07 against the vendors' own pages; the deck encodes this so an agent doesn't have to guess.
+
+| you pay | the budget that actually limits you | headless (`-p` / `exec`) draws from | how the deck reads it |
+|---|---|---|---|
+| Claude Pro/Max | 5h + 7-day windows, in `%` | the same windows — Anthropic announced a separate credit for `claude -p` on 2026-06-15 and **paused it** ([help article](https://support.claude.com/en/articles/15036540)); our own test moved the 5h window 3%→5% with one headless run | `deck account tap` (statusline `rate_limits`) + Claude Code's cached utilization; `total_cost_usd` is shown as `≈` API-equivalent, never as spend |
+| ChatGPT Plus/Pro (Codex) | 5h + weekly windows, in `%` | the same windows | the newest non-null `rate_limits` snapshot in `<home>/sessions/**/rollout-*.jsonl` (often null in current builds, can lag — [openai/codex#10233](https://github.com/openai/codex/issues/10233)); else the ledger |
+| Cursor Pro/Pro+/Ultra | two monthly pools: **Cursor Models** (Composer, Grok — separate, generous) and **Other Models = $20 / $70 / $400 of third-party usage at provider API prices**, then on-demand ([usage limits](https://cursor.com/help/models-and-usage/usage-limits)) | the same pools | per-run tokens × catalog prices as `$` against `--metric usd --limit 20/30d`; Cursor-native models are `price=0` |
+| API keys (Anthropic / OpenAI / Google) | your money | your money | `$` from the vendor's reported cost or tokens × price; `--metric usd` budgets |
+| Local (Ollama, LM Studio) | nothing | nothing | tokens, for curiosity |
+
+`deck ledger` therefore shows two dollar columns — **METERED $** (real) and **≈API-EQUIV $** (what a flat
+subscription's runs would have cost) — and `deck status` prefixes equivalents with `≈`. If a vendor changes
+the rules again (Anthropic un-pauses the credit), the same account switches to `--metric usd --limit 200/30d`.
+
 ## Costs and headroom
 
 - **Subscription headroom is the vendor's own number, read from official surfaces — never the network,
@@ -157,6 +173,8 @@ Workers you drive by hand (interactive Claude Code, yourself) close the loop wit
 `deck handoff <task> --status END --text "..."`.
 
 ## Hosting: one box, reached over SSH
+
+Using Cursor cloud agents? See [SANDBOX.md](SANDBOX.md): `.cursor/environment.json` boots them with `deck` and the vendor CLIs installed.
 
 The deck is a folder and one file, so its home is any always-on machine you own: a $5 VPS, a Mac mini, a
 Raspberry Pi. Install `deck` and the vendor CLIs there, log each account in once from your phone

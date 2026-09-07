@@ -235,6 +235,24 @@ deck models set catalog-priced vendor=pvend price=2/10 >/dev/null
 deck task add "priced" --id t19 >/dev/null; expect 0 deck run t19 --hand priced
 grep -q '"cost_usd": 2.0' .deck/ledger.jsonl && pass "catalog model price -> cost_usd when hand/account have none" || fail "catalog price"
 
+# billing semantics: subscription $ is API-equivalent, metered $ is real; codex rollout reader
+OA_SECRET=x deck account add oa --login-cmd true >/dev/null
+deck hand add oah --account oa --cmd 'echo "{\"usage\":{\"input_tokens\":1000,\"output_tokens\":10},\"total_cost_usd\":0.5}"' >/dev/null
+deck task add "equiv" --id t20 >/dev/null; expect 0 deck run t20 --hand oah
+grep -q '"cost_usd": 0.5, "billing": "equiv"' .deck/ledger.jsonl && grep -q '"billing": "metered"' .deck/ledger.jsonl && pass "ledger tags subscription $ as equiv, priced/API $ as metered" || fail "billing tags"
+deck ledger | grep -E "^oa " | grep -q -- "-  *0.50" && pass "ledger separates metered from API-equivalent dollars" || fail "ledger columns ($(deck ledger | grep '^oa '))"
+CH="$HOME/.config/deck/homes/cx"; mkdir -p "$CH/sessions/2026/09/07"
+python3 - "$CH" <<'EOF2'
+import json, sys, time, datetime as dt
+d = sys.argv[1]; now = dt.datetime.now(dt.timezone.utc)
+lines = [{"timestamp": (now - dt.timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S.000Z"), "type": "event_msg", "payload": {"type": "token_count", "info": None, "rate_limits": None}},
+         {"timestamp": (now - dt.timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%S.000Z"), "type": "event_msg", "payload": {"type": "token_count", "info": None,
+          "rate_limits": {"primary": {"used_percent": 31.0, "window_minutes": 299, "resets_in_seconds": 7200}, "secondary": {"used_percent": 64.0, "window_minutes": 10079, "resets_in_seconds": 200000}}}}]
+open(d + "/sessions/2026/09/07/rollout-1.jsonl", "w").write("\n".join(json.dumps(x) for x in lines) + "\n")
+EOF2
+deck account add cx --vendor codex --home "$CH" --status-cmd true >/dev/null 2>&1
+[ "$(deck account ls --json | python3 -c 'import json,sys; a=[x for x in json.load(sys.stdin) if x["id"]=="cx"][0]; h=a["headroom"]; print(h["source"], h["window"], h["used"])')" = "codex-rollout 1w 64.0" ] && pass "codex rollout rate_limits snapshot -> windows (tightest governs)" || fail "codex rollout"
+
 deck event NOTE --msg hi >/dev/null
 [ "$(deck events --type NOTE -n 1 --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["msg"])')" = hi ] && pass "events filter" || fail "events filter"
 

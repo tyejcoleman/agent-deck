@@ -74,8 +74,16 @@ token** (the same posture as [tokenroom](https://github.com/tyejcoleman/tokenroo
 3. **The LEDGER** (deck's own runs) for vendors with neither, in the account's `metric` (`runs`, `tokens`,
    `usd`), against `limits`. `usage_cmd` + `deck account sync` can feed any other number.
 
+For Codex the same role is played by the newest non-null `rate_limits` snapshot in the login's session
+rollouts (`<home>/sessions/**/rollout-*.jsonl`) — lagging and often null in current builds, but official
+and local. Every LEDGER row carries `billing`: `metered` (API keys, or a priced run on a dollar-denominated
+allowance such as Cursor's Other Models pool), `equiv` (a flat subscription's API-equivalent value, e.g.
+Claude's `total_cost_usd`), `local`, or `subscription`. Only `metered` dollars count toward a `usd` limit or
+appear as spend; equivalents are displayed with `≈`.
+
 On a rate-limit response the account cools down until the vendor's exact reset time when known (the tap's
-`resets_at`, or the epoch Claude Code appends to its limit message), else a short default. `plan` is a
+`resets_at`, the epoch Claude Code appends to its limit message, or a "try again at 7:58 PM" / "resets in 2h"
+hint parsed from the output), else a short default. `plan` is a
 label for the research task (vendors without utilization surfaces). `price` computes `cost_usd`;
 `monthly_usd` is informational. Observed on a Max account (2026-09-07): headless `claude -p` runs *did*
 move the 5h window (3% → 5% after a $0.31 run); the deck asserts neither way — it reads the numbers.

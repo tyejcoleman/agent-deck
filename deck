@@ -22,7 +22,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 COSTS = ("free", "low", "mid", "high")
 HOMES = "~/.config/deck/homes"      # one vendor login dir per account; tokens live there (or the OS keychain), never in .deck/
 SECRETS = "~/.config/deck/secrets"  # 0600 files, used only when no keychain/libsecret is available
@@ -37,7 +37,7 @@ VENDORS = {
                    models_url="https://api.anthropic.com/v1/models", models_hdr={"x-api-key": "{key}", "anthropic-version": "2023-06-01"},
                    logout="claude auth logout", cmd="claude -p --add-dir {taskdir} --permission-mode acceptEdits --allowedTools Bash --output-format json{model} {prompt}",
                    flag="--model", effort=" --effort {effort}", efforts="low medium high xhigh max", cost="high"),
-    "codex": dict(home="CODEX_HOME", default_home="~/.codex", key="OPENAI_API_KEY", login="codex login", headless="codex login --device-auth", install="npm i -g @openai/codex",
+    "codex": dict(home="CODEX_HOME", default_home="~/.codex", usage_rollouts="sessions", key="OPENAI_API_KEY", login="codex login", headless="codex login --device-auth", install="npm i -g @openai/codex",
                   models_url="https://api.openai.com/v1/models", models_hdr={"Authorization": "Bearer {key}"},
                   status="codex login status", logout="codex logout",
                   cmd="codex exec --sandbox workspace-write --add-dir {taskdir} --skip-git-repo-check --json{model} {prompt}", flag="-m",
@@ -136,6 +136,8 @@ ACCOUNTS (agents set them up; only humans log in):
   Machine already logged in to the vendor? deck account add <id> --home default reuses that login.
   Subscription headroom (Claude): deck account tap <id> once; then deck status shows "% of 5h/1w (tap)" and
   deck account sync <id> shows the reset times = when it can be used again. Estimates are marked ≈.
+  Dollars: real only for API keys and Cursor's third-party pool ($ allowance). On Claude/Codex subscriptions the
+  budget is the % window; any $ shown is API-equivalent (≈), not spend. Cursor Models (Composer/Grok) are price 0.
   Never ask for a key in chat. Never read ~/.config/deck. Tokens stay in the vendor's dir or the OS keychain.
 
 WORKER (Claude Code, Codex, Cursor, Gemini) started by `deck run`:
@@ -632,9 +634,52 @@ def claude_cache_windows(acct):
     return {"windows": wins, "at": _epoch_iso(c.get("fetchedAtMs")), "source": "claude-cache"} if wins and c.get("fetchedAtMs") else None
 
 
+def codex_rollout_windows(acct):
+    """Codex keeps session rollouts under <home>/sessions/**/rollout-*.jsonl; token_count events sometimes carry rate_limits
+    (primary ~5h, secondary ~weekly, used_percent + resets_in_seconds). Often null in current builds and can lag; the newest
+    non-null snapshot is still the only official local surface Codex has (see openai/codex#10233)."""
+    v = VENDORS.get(acct.get("vendor"), {})
+    if acct.get("auth") != "oauth" or not v.get("usage_rollouts"):
+        return None
+    root = Path(acct_home(acct)) / v["usage_rollouts"]
+    if not root.is_dir():
+        return None
+    files = sorted(root.rglob("rollout-*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)[:20]
+    best = None
+    for f in files:
+        try:
+            with open(str(f), encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if '"rate_limits"' not in line or '"rate_limits":null' in line.replace(" ", ""):
+                        continue
+                    try:
+                        o = json.loads(line)
+                    except ValueError:
+                        continue
+                    rl = ((o.get("payload") or {}).get("rate_limits")) if isinstance(o.get("payload"), dict) else None
+                    at = o.get("timestamp")
+                    if isinstance(rl, dict) and at and (best is None or at > best[0]):
+                        best = (at, rl)
+        except OSError:
+            continue
+    if not best:
+        return None
+    at, rl = best
+    t0 = ts(at[:19] + "Z") if len(at) >= 19 else now()
+    wins = {}
+    for key in ("primary", "secondary"):
+        x = rl.get(key)
+        if isinstance(x, dict) and x.get("used_percent") is not None:
+            mins = x.get("window_minutes") or (300 if key == "primary" else 10080)
+            label = "5h" if mins < 24 * 60 else "1w" if mins < 40 * 24 * 60 else "%dd" % (mins // 1440)
+            reset = _epoch_iso(x["resets_at"]) if x.get("resets_at") else iso(t0 + dt.timedelta(seconds=int(x["resets_in_seconds"]))) if x.get("resets_in_seconds") is not None else None
+            wins[label] = {"percent": float(x["used_percent"]), "reset_at": reset}
+    return {"windows": wins, "at": iso(t0), "source": "codex-rollout"} if wins else None
+
+
 def vendor_usage(deck, acct):
     """Freshest official-surface reading of the vendor's own utilization numbers. Never the network, never a token."""
-    cands = [r for r in (tap_windows(acct), claude_cache_windows(acct)) if r and r.get("at")]
+    cands = [r for r in (tap_windows(acct), claude_cache_windows(acct), codex_rollout_windows(acct)) if r and r.get("at")]
     return max(cands, key=lambda r: r["at"]) if cands else None
 
 
@@ -658,6 +703,11 @@ def refresh_remote(deck, acct, max_age=60):
     deck.save(acct, "accounts", acct["id"] + ".json")
 
 
+def metered(row, acct=None):
+    """Rows whose dollars are real: tagged metered, or untagged rows on API-key accounts."""
+    return row.get("billing") == "metered" or (row.get("billing") is None and (acct or {}).get("auth") == "apikey")
+
+
 def headroom(acct, ledger):
     """Tightest of the account's rate windows (`limits: {"5h": 200, "1w": 1000}`), from the ledger plus an optional
     fresh `remote` reading (`deck account sync`). Subscription windows are estimates unless synced."""
@@ -669,7 +719,7 @@ def headroom(acct, ledger):
     for win, limit in limits.items():
         rows = [r for r in mine if (t - ts(r["ts"])).total_seconds() < dur(win)]
         sums = {"runs": sum(r.get("units", 1) for r in rows), "tokens": sum((r.get("tokens_in") or 0) + (r.get("tokens_out") or 0) for r in rows),
-                "usd": round(sum(r.get("cost_usd") or 0 for r in rows), 4)}
+                "usd": round(sum(r.get("cost_usd") or 0 for r in rows if metered(r, acct)), 4)}
         first = min((r["ts"] for r in rows), default=None)
         if logs is not None:  # every session on this login, not just deck runs
             lrows = [r for r in logs if (t - ts(r[0])).total_seconds() < dur(win)]
@@ -733,10 +783,11 @@ def roster(deck):
     last, spend = {r.get("hand"): r["ts"] for r in ledger}, {}
     for r in ledger:
         if (now() - ts(r["ts"])).total_seconds() < 7 * 86400 and r.get("hand"):
-            sp = spend.setdefault(r["hand"], [0, 0.0, 0])
+            sp = spend.setdefault(r["hand"], [0, 0.0, 0, False])
             sp[0] += 1
             sp[1] += r.get("cost_usd") or 0
             sp[2] += (r.get("tokens_in") or 0) + (r.get("tokens_out") or 0)
+            sp[3] = sp[3] or metered(r, accts.get(next((h.get("account") for h in deck.items("hands") if h["id"] == r["hand"]), None)))
     res = []
     for h in deck.items("hands"):
         c, a = claim_of(deck, h["id"]), hr.get(h.get("account"))
@@ -744,7 +795,7 @@ def roster(deck):
         state = "claimed" if c else "no-account" if not a else bad if bad else "free" if a["state"] == "ok" else a["state"]
         sp = spend.get(h["id"])
         res.append(dict(h, state=state, claim=c, headroom=a, last_used=last.get(h["id"]),
-                        observed={"runs_7d": sp[0], "avg_usd": round(sp[1] / sp[0], 3), "avg_tokens": int(sp[2] / sp[0])} if sp else None))
+                        observed={"runs_7d": sp[0], "avg_usd": round(sp[1] / sp[0], 3), "avg_tokens": int(sp[2] / sp[0]), "metered": sp[3]} if sp else None))
     return res
 
 
@@ -1111,7 +1162,8 @@ def cmd_status(deck, a):
                 "until %s" % hr["cooldown_until"] if h["state"] == "cooldown" else
                 "resets in %s" % fdur((ts(hr["reset_at"]) - now()).total_seconds()) if hr.get("reset_at") else "")
         ob = h.get("observed")
-        rows.append([h["id"], h.get("model") or "-", h.get("account", ""), h.get("cost", ""), "$%.2f/%dk" % (ob["avg_usd"], ob["avg_tokens"] / 1000) if ob else "-",
+        rows.append([h["id"], h.get("model") or "-", h.get("account", ""), h.get("cost", ""),
+                     ("%s$%.2f/%dk" % ("" if ob["metered"] else "≈", ob["avg_usd"], ob["avg_tokens"] / 1000) if ob["avg_usd"] else "%dk tok" % (ob["avg_tokens"] / 1000)) if ob else "-",
                      h["state"], head_text(hr, accts.get(h.get("account"))), note])
     print(table(["HAND", "MODEL", "ACCOUNT", "COST", "OBSERVED", "STATE", "HEADROOM", "NOTE"], rows) if rows else "no hands (deck hand add ...)")
     print("tasks: " + (", ".join("%s %d" % kv for kv in sorted(counts.items())) or "none"))
@@ -1281,8 +1333,14 @@ def cmd_run(deck, a):
     (tdir / "runs").mkdir(exist_ok=True)
     (tdir / "runs" / ("%d.log" % n)).write_text(output, encoding="utf-8")
     usage, price = parse_usage(output), hand.get("price") or acct.get("price") or (deck.models().get("models", {}).get(model or "") or {}).get("price")
+    priced = False
     if price and not usage.get("cost_usd") and (usage.get("tokens_in") or usage.get("tokens_out")):
         usage["cost_usd"] = round((usage.get("tokens_in", 0) * price.get("in", 0) + usage.get("tokens_out", 0) * price.get("out", 0)) / 1e6, 6)
+        priced = True
+    # what the dollars mean: metered = real spend or a dollar-denominated allowance (API keys; Cursor's Other Models pool);
+    # equiv = a flat subscription's API-equivalent value (Claude Max reports total_cost_usd but bills the % window); local = nothing
+    usage["billing"] = ("metered" if acct.get("auth") == "apikey" or priced else "equiv" if acct.get("auth") == "oauth" and usage.get("cost_usd") else
+                        "local" if acct.get("auth", "none") == "none" else "subscription")
     wrote = hf.exists() and hf.stat().st_mtime > before
     if wrote:
         status = parse_status(hf.read_text(encoding="utf-8"))
@@ -1317,7 +1375,7 @@ def cmd_run(deck, a):
                                         body="Output tail:\n\n```\n%s\n```" % result_text(output)), encoding="utf-8")
     deck.append("ledger.jsonl", dict({"ts": iso(now()), "account": acct["id"], "hand": hand["id"], "model": model, "task": task["id"], "run": n,
                                       "units": 1, "seconds": secs, "exit": code}, **usage))
-    ev = finish(deck, task, status, by, run=n, seconds=secs, exit=code, msg=msg, **usage)
+    ev = finish(deck, task, status, by, run=n, seconds=secs, exit=code, msg=msg, **{k: v for k, v in usage.items() if k != "billing"})
     out(a, dict(ev, handoff=str(hf), log=str(tdir / "runs" / ("%d.log" % n))),
         "%s %s on %s (%s, exit %d%s)\nhandoff: %s" % (status, task["id"], hand["id"], fdur(secs), code, "; " + msg if msg else "", hf))
     if msg and msg.startswith("model ") and not getattr(a, "_probe", False) and not task["id"].startswith("models-refresh"):
@@ -1478,17 +1536,21 @@ def cmd_usage(deck, a):
 def cmd_ledger(deck, a):
     since = now() - dt.timedelta(seconds=dur(a.since)) if a.since else None
     rows = [r for r in deck.rows("ledger.jsonl") if (not a.account or r.get("account") == a.account) and (not since or ts(r["ts"]) >= since)]
+    accts = {x["id"]: x for x in deck.items("accounts")}
     tot = {}
     for r in rows:
-        t = tot.setdefault(r.get("account", "?"), {"account": r.get("account", "?"), "runs": 0, "units": 0, "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "seconds": 0})
+        t = tot.setdefault(r.get("account", "?"), {"account": r.get("account", "?"), "runs": 0, "units": 0, "tokens_in": 0, "tokens_out": 0, "metered_usd": 0.0, "equiv_usd": 0.0, "seconds": 0})
         t["runs"] += 1
-        for k in ("units", "tokens_in", "tokens_out", "cost_usd", "seconds"):
+        for k in ("units", "tokens_in", "tokens_out", "seconds"):
             t[k] += r.get(k) or 0
-    subs = {x["id"]: x["monthly_usd"] for x in deck.items("accounts") if x.get("monthly_usd")}
+        t["metered_usd" if metered(r, accts.get(r.get("account"))) else "equiv_usd"] += r.get("cost_usd") or 0
+    subs = {x["id"]: x["monthly_usd"] for x in accts.values() if x.get("monthly_usd")}
     out(a, {"rows": rows, "totals": list(tot.values()), "subscriptions_usd_per_month": subs},
-        (table(["ACCOUNT", "RUNS", "UNITS", "TOKENS IN", "TOKENS OUT", "API USD", "TIME"],
-               [[t["account"], t["runs"], t["units"], t["tokens_in"], t["tokens_out"], "%.4f" % t["cost_usd"], fdur(t["seconds"])] for t in tot.values()]) if tot else "ledger empty")
-        + ("\nsubscriptions: $%.2f/mo (%s)" % (sum(subs.values()), ", ".join("%s $%g" % kv for kv in subs.items())) if subs else ""))
+        (table(["ACCOUNT", "RUNS", "TOKENS IN", "TOKENS OUT", "METERED $", "≈API-EQUIV $", "TIME"],
+               [[t["account"], t["runs"], t["tokens_in"], t["tokens_out"], "%.2f" % t["metered_usd"] if t["metered_usd"] else "-",
+                 "%.2f" % t["equiv_usd"] if t["equiv_usd"] else "-", fdur(t["seconds"])] for t in tot.values()]) if tot else "ledger empty")
+        + ("\nsubscriptions: $%.2f/mo flat (%s) - their runs are counted in %% of window, the $ column is what they would cost at API rates"
+           % (sum(subs.values()), ", ".join("%s $%g" % kv for kv in subs.items())) if subs else ""))
 
 
 def cmd_events(deck, a):
