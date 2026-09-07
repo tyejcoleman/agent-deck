@@ -210,12 +210,13 @@ def scan_json(output):
 
 
 def parse_usage(output):
-    """Tokens/cost from vendor JSON: Claude `usage`+`total_cost_usd`, Codex `turn.completed.usage`, Gemini `stats.models`."""
+    """Tokens/cost from vendor JSON: Claude `usage`+`total_cost_usd`, Codex `turn.completed.usage`, Cursor camelCase `usage`, Gemini `stats.models`."""
     u = {"tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0}
     for o in scan_json(output):
         us = o.get("usage") if isinstance(o.get("usage"), dict) else {}
-        u["tokens_in"] += int(us.get("input_tokens") or 0) + int(us.get("cache_read_input_tokens") or 0) + int(us.get("cache_creation_input_tokens") or 0)
-        u["tokens_out"] += int(us.get("output_tokens") or 0)
+        u["tokens_in"] += sum(int(us.get(k) or 0) for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+                                                             "inputTokens", "cacheReadTokens", "cacheWriteTokens"))  # Claude/Codex snake, Cursor camel
+        u["tokens_out"] += int(us.get("output_tokens") or us.get("outputTokens") or 0)
         u["cost_usd"] += float(o.get("total_cost_usd") or 0)
         for m in (((o.get("stats") or {}).get("models") or {}) if isinstance(o.get("stats"), dict) else {}).values():
             t = (m or {}).get("tokens") or {}

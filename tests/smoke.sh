@@ -168,6 +168,10 @@ grep -q '"type": "MODEL", "model": "bad-model"' .deck/events.jsonl && [ "$(deck 
   && [ -n "$(find .deck/tasks -maxdepth 1 -name 'models-refresh*')" ] && pass "model error -> catalog marked, research task dispatched, re-routed to END" || fail "self-recovery"
 deck wait "$(basename "$(find .deck/tasks -maxdepth 1 -name 'models-refresh*' | head -1)")" --timeout 20s >/dev/null || true
 
+deck hand add camel --account pv --cmd 'echo "{\"usage\":{\"inputTokens\":10,\"outputTokens\":5,\"cacheReadTokens\":100}}"' >/dev/null
+deck task add "camel" --id t18 >/dev/null; expect 0 deck run t18 --hand camel
+grep -q '"tokens_in": 110, "tokens_out": 5' .deck/ledger.jsonl && pass "cursor camelCase usage parsed" || fail "camelCase usage"
+
 deck event NOTE --msg hi >/dev/null
 [ "$(deck events --type NOTE -n 1 --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["msg"])')" = hi ] && pass "events filter" || fail "events filter"
 

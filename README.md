@@ -143,6 +143,22 @@ subscriptions, `$ in window` for API accounts, tokens for local models.
 Workers you drive by hand (interactive Claude Code, yourself) close the loop with
 `deck handoff <task> --status END --text "..."`.
 
+## Hosting: one box, reached over SSH
+
+The deck is a folder and one file, so its home is any always-on machine you own: a $5 VPS, a Mac mini, a
+Raspberry Pi. Install `deck` and the vendor CLIs there, log each account in once from your phone
+(`deck account login X --headless` prints a URL or device code), and every agent uses that same deck:
+
+- agents on the box (OpenClaw, a Grok bot, Cos): `deck …` or `deck mcp` directly;
+- agents anywhere else, and you on your phone: `ssh box deck status --json`, or MCP over SSH —
+  `{"command": "ssh", "args": ["box", "deck", "mcp"]}` — stdio MCP passes through ssh unchanged.
+
+No HTTP server, nothing exposed, no sync problem: runs happen where the logins are. Sync `.deck/` with
+git if you want the roster mirrored (it never contains secrets), but keep one box as the runner.
+
+Ephemeral hosts (CI, cloud-agent sandboxes) can't hold logins across runs; give them API keys as
+`DECK_SECRET_<ACCOUNT>` environment variables (or a `claude setup-token` result) and skip login entirely.
+
 ## Agent-native
 
 - `deck init` drops `.deck/AGENTS.md`: any agent that lands in the folder learns the protocol in 30 lines.
