@@ -6,7 +6,7 @@ Agent Deck is a thin, open protocol that lets any meta-agent (Cos, OpenClaw, a G
 your coding agents (Claude Code, Codex, Cursor, Gemini CLI, local models, anything with a CLI) as
 *hands*: connect every subscription and API account you have once, see which one has headroom right
 now, dispatch a task to the right hand, and get woken when it ends, blocks, or needs you to log in
-again. It is a directory of JSON + Markdown files, one zero-dependency Python file, and an optional
+again. It is a directory of JSON + Markdown files, one zero-dependency Python file (~1400 lines), and an optional
 MCP mirror. No daemon, no database, no cloud.
 
 ```
@@ -51,9 +51,12 @@ deck hand add codex-sol    --account codex-team  --model gpt-5.6-sol      --cost
 deck hand add local-qwen   --account ollama      --model qwen3-coder:30b
 
 deck status                       # the roster: free / claimed / exhausted / needs-login, headroom
-deck task add "Add retry to fetcher" --cost mid   # then edit .deck/tasks/<id>/CONTEXT.md
+deck task add "Add retry to fetcher" --cost mid --needs refactor   # then edit .deck/tasks/<id>/CONTEXT.md
 deck run <task-id>                # route -> claim -> run the hand -> ledger -> HANDOFF.md -> END|BLOCKED
+deck run <id> --model claude-sonnet-5 --effort low   # on-the-fly model/effort for this run
+deck run t1 t2 t3 --bg && deck wait t1 t2 t3        # one free hand each, in parallel, detached
 deck events -f --type END,BLOCKED,AUTH   # wake on it, read the handoff, steer the next task
+deck models                       # catalog for YOUR providers: availability, good_for, efforts
 deck ledger --since 24h           # tokens / API cost / time per account + subscription $/mo
 ```
 
@@ -81,6 +84,34 @@ vendor CLI keeps them; when one really expires:
 
 Nothing in `.deck/` is ever a secret, so the folder is safe to sync and commit. `deck account check`
 refreshes state without touching credentials; `deck account logout` drops a login or key.
+
+## Models: a catalog that stays true
+
+`deck models` is the catalog your meta-agent reads before choosing a hand — scoped to the vendors you
+actually have accounts for, with `AVAIL`, `good_for` tags, supported effort levels, context, cost class.
+It stays fresh two lazy ways, and heals itself:
+
+- **sync** (`deck models sync`, automatic when a day old): every account that can enumerate models is
+  asked — Cursor (`cursor-agent models`), API-key accounts (`/models` endpoints), Ollama/LM Studio — and
+  `AVAIL` is updated. Claude/Codex/Gemini subscriptions can't enumerate; they rely on the next two.
+- **research** (`deck models refresh --if-stale`, weekly, or `--run` to dispatch it): a cheap *task* for
+  one of your own hands: read the vendors' docs, verify each id with `deck models probe <id>` (one tiny
+  real call), write entries with `deck models set`. In the dogfood run Claude produced a five-model
+  catalog with pricing and tags in four minutes and flagged two deck bugs in its handoff.
+- **self-recovery**: a run that hits a model error marks the model unavailable, emits `MODEL`,
+  dispatches the research task detached, and re-routes the failed task once without that model. Hands
+  on unavailable models show `no-model` and are skipped.
+
+Effort is controllable per run where the harness supports it: `--effort low|medium|high|xhigh|max` maps
+to Claude `--effort`, Codex `-c model_reasoning_effort`, Cursor `model[effort=…]`; Gemini ignores it.
+
+## Parallel hands under one meta-agent
+
+Free hands are your parallelism budget. `deck route` lists them; `deck run t1 t2 t3 --bg` detaches one
+run per task, each claiming its own hand; `deck wait t1 t2 t3` (or `deck events -f`) collects results.
+A runner that dies is reaped to `failed` by the next `status`, so nothing stays stuck. Whether to go wide
+or sequential is the meta-agent's call, made from headroom: `deck status` shows `% of window` for
+subscriptions, `$ in window` for API accounts, tokens for local models.
 
 ## Costs and headroom
 
@@ -123,21 +154,21 @@ Workers you drive by hand (interactive Claude Code, yourself) close the loop wit
 ```
 
   Tools: `deck_status`, `deck_route`, `deck_task_add`, `deck_task_ls`, `deck_task_show`, `deck_run`,
-  `deck_handoff`, `deck_events`, `deck_ledger`, `deck_account_add`, `deck_account_ls`,
-  `deck_account_check`, `deck_account_cooldown`, `deck_hand_add`, `deck_usage_add`. Each is a 1:1
+  `deck_wait`, `deck_handoff`, `deck_events`, `deck_ledger`, `deck_models`, `deck_models_refresh`, `deck_account_add`,
+  `deck_account_ls`, `deck_account_check`, `deck_account_cooldown`, `deck_hand_add`, `deck_usage_add`. Each is a 1:1
   mirror of a CLI command. There is deliberately no login tool: credentials never pass through an agent.
 
 ## Vendor templates
 
 `deck hand add` seeds `cmd` from the account's vendor (verified against Claude Code 2.1, codex-cli 0.153,
-cursor-agent 2026.09, gemini-cli 0.58). Edit `hands/<id>.json` freely; deck only cares about the placeholders.
+cursor-agent 2026.09, gemini-cli 0.58). `{model}` expands at run time to the model and effort flags. Edit `hands/<id>.json` freely; deck only cares about the placeholders.
 
 | vendor | login isolation | cmd |
 |---|---|---|
-| claude   | `CLAUDE_CONFIG_DIR` | `claude -p --add-dir {taskdir} --permission-mode acceptEdits --allowedTools Bash --output-format json --model M {prompt}` |
-| codex    | `CODEX_HOME` | `codex exec --sandbox workspace-write --add-dir {taskdir} --skip-git-repo-check --json -m M {prompt}` |
-| cursor   | `CURSOR_CONFIG_DIR` | `cursor-agent -p --force --add-dir {taskdir} --output-format json --model M {prompt}` |
-| gemini   | `GEMINI_CLI_HOME` | `gemini -p {prompt} --include-directories {taskdir} --approval-mode yolo --output-format json -m M` |
+| claude   | `CLAUDE_CONFIG_DIR` | `claude -p --add-dir {taskdir} --permission-mode acceptEdits --allowedTools Bash --output-format json{model} {prompt}` |
+| codex    | `CODEX_HOME` | `codex exec --sandbox workspace-write --add-dir {taskdir} --skip-git-repo-check --json{model} {prompt}` |
+| cursor   | `CURSOR_CONFIG_DIR` | `cursor-agent -p --force --add-dir {taskdir} --output-format json{model} {prompt}` |
+| gemini   | `GEMINI_CLI_HOME` | `gemini -p {prompt} --include-directories {taskdir} --approval-mode yolo --output-format json{model}` |
 | ollama   | — (`OLLAMA_HOST`) | `codex exec --oss --local-provider ollama … -m M {prompt}` |
 | lmstudio | — | `codex exec --oss --local-provider lmstudio … -m M {prompt}` |
 

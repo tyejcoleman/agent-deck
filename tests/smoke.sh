@@ -140,6 +140,34 @@ deck hand add mwh --account mw --cmd 'sh -c "cat >/dev/null"' >/dev/null
 for i in 1 2 3; do deck task add "mw$i" --id mw$i >/dev/null; deck run mw$i --hand mwh >/dev/null; done
 [ "$(deck account ls --json | python3 -c 'import json,sys; a=[x for x in json.load(sys.stdin) if x["id"]=="mw"][0]["headroom"]; print(a["window"], a["state"])')" = "1w exhausted" ] && pass "multi-window: tightest window governs" || fail "multi-window"
 
+# ---- run-time model/effort, parallel bg runs, wait, reaper, catalog + self-recovery ----
+deck account add pv --vendor custom --auth none >/dev/null
+deck hand add ph --account pv --vendor pvend --model good-1 --cost mid --cmd 'sh -c "cat>/dev/null; case \"\$*\" in *bad-model*) echo \"Error: unknown model: \$*\"; exit 1;; esac; echo {\\\"result\\\":\\\"OK\\\"}" x {model} e={effort}' >/dev/null
+deck task add "dry" --id t15 >/dev/null
+deck run t15 --hand ph --model m9 --effort high --dry | grep -q -- "--model m9 e=high" && pass "run-time --model/--effort expansion" || fail "model/effort expansion"
+for i in 1 2 3; do deck hand add bg$i --account pv --cmd 'sh -c "cat>/dev/null; sleep 1"' >/dev/null; deck task add "bg$i" --id bg$i >/dev/null; done
+deck run bg1 bg2 bg3 --bg >/dev/null
+sleep 0.5; [ "$(deck task ls --status running --json | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')" = 3 ] && pass "3 detached runs in parallel" || fail "parallel bg"
+expect 0 deck wait bg1 bg2 bg3 --timeout 30s
+pass "wait returns when all finish"
+deck task add "dead" --id t16 >/dev/null
+python3 -c "import json; p='.deck/tasks/t16/task.json'; t=json.load(open(p)); t.update(status='running', hand='bg1', pid=999999, started='2026-01-01T00:00:00Z'); json.dump(t, open(p,'w'))"
+deck status >/dev/null
+[ "$(deck task show t16 --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')" = failed ] && pass "dead runner reaped" || fail "reaper"
+expect 0 deck models probe good-1 --hand ph
+expect 1 deck models probe bad-model --hand ph
+[ "$(deck models --no-sync --json | python3 -c 'import json,sys; m=json.load(sys.stdin)["models"]; print(m["good-1"]["available"], m["bad-model"]["available"])')" = "True False" ] && [ -z "$(find .deck/tasks -maxdepth 1 -name 'probe-*')" ] && pass "probe records availability, leaves no task" || fail "probe"
+deck hand add bm --account pv --model bad-model --cmd true >/dev/null
+deck status | grep -q "bm .*no-model" && pass "hand on unavailable model excluded" || fail "no-model state"
+python3 -c "import json; p='.deck/models.json'; m=json.load(open(p)); m['models']['bad-model']['available']=True; json.dump(m,open(p,'w'))"
+deck hand rm bm >/dev/null
+deck hand add cheap --account pv --vendor pvend --model good-1 --cost low --cmd 'sh -c "cat>/dev/null"' >/dev/null
+deck task add "recover" --id t17 --model bad-model --cost mid >/dev/null
+expect 0 deck run t17
+grep -q '"type": "MODEL", "model": "bad-model"' .deck/events.jsonl && [ "$(deck task show t17 --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["status"], d.get("rejected_model"))')" = "done bad-model" ] \
+  && [ -n "$(find .deck/tasks -maxdepth 1 -name 'models-refresh*')" ] && pass "model error -> catalog marked, research task dispatched, re-routed to END" || fail "self-recovery"
+deck wait "$(basename "$(find .deck/tasks -maxdepth 1 -name 'models-refresh*' | head -1)")" --timeout 20s >/dev/null || true
+
 deck event NOTE --msg hi >/dev/null
 [ "$(deck events --type NOTE -n 1 --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["msg"])')" = hi ] && pass "events filter" || fail "events filter"
 

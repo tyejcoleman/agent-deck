@@ -61,16 +61,30 @@ reading from `deck account sync` (runs `usage_cmd`, expected to print `{used, li
 joins the comparison when fresher than an hour. `price` (USD per 1M tokens) computes `cost_usd` for
 runs whose vendor reports tokens but no cost. `monthly_usd` is informational (shown in `deck ledger`).
 
-**HAND** — `{"id", "vendor", "account", "model", "cost": "low|mid|high", "cmd"}`. `cmd` is a shell
-string. Placeholders: `{prompt}` (shell-quoted), `{context}`, `{handoff}`, `{taskdir}` (absolute paths), `{task}`.
-Templates pass `--add-dir {taskdir}` so the worker may write HANDOFF.md outside the repo without a prompt.
-If `{prompt}` is absent, or the prompt exceeds 100KB (Linux caps one argv string at 128KB), the prompt
-is piped to stdin instead — `claude -p`, `codex exec`, and `cursor-agent -p` all read it from there.
-Reusable presets, not a registry: delete any hand nobody uses.
+**HAND** — `{"id", "vendor", "account", "model", "effort", "cost": "free|low|mid|high", "price", "cmd"}`.
+`cmd` is a shell string. Placeholders: `{prompt}` (shell-quoted), `{context}`, `{handoff}`, `{taskdir}`
+(absolute paths), `{task}`, `{model}` and `{effort}`. `{model}` expands *at run time* to the vendor's model
+flag plus its effort flag (`--model X --effort high` / `-m X -c model_reasoning_effort=high` /
+`--model 'X[effort=high]'`), so `deck run --model X --effort E` overrides a hand per run; precedence is
+run flag → task field → hand default. Templates pass `--add-dir {taskdir}` so the worker may write
+HANDOFF.md outside the repo. If `{prompt}` is absent, or the prompt exceeds 100KB (Linux caps one argv
+string at 128KB), the prompt is piped to stdin. Reusable presets, not a registry: delete any hand nobody uses.
 
-**TASK** — `{"id", "title", "status": "open|running|done|blocked|failed", "cost", "cwd", "hand",
-"runs", "created"}`. `cost` is a routing preference. `cwd` is where the worker runs (default: the
-directory containing `.deck/`).
+**TASK** — `{"id", "title", "status": "open|running|done|blocked|failed", "cost", "needs": [...], "model",
+"effort", "cwd", "hand", "runs", "pid", "created"}`. `cost`/`needs`/`model` are routing preferences
+(`needs` are matched against catalog `good_for` tags). `cwd` is where the worker runs (default: the
+directory containing `.deck/`). `pid` is set while a run is live; a task whose runner died is reaped to
+`failed` by the next `status`/`route`/`run`.
+
+**CATALOG** (`models.json`) — `{"updated", "synced", "models": {"<id>": {"vendor", "available",
+"seen", "good_for": [...], "efforts": [...], "cost", "context", "notes"}}}`. Scoped to the vendors you
+have accounts for. Two freshness loops, both lazy: **sync** (`deck models sync`, auto when older than a day)
+asks every account that can enumerate — Cursor (`cursor-agent models`), API-key accounts (`/models`
+endpoints), local servers — and flips `available`; **research** (`deck models refresh --if-stale`, weekly)
+creates a cheap TASK whose worker reads the vendors' docs, verifies ids with `deck models probe` (one tiny
+real call), and writes entries via `deck models set`. Hands whose model is `available: false` show
+`no-model` and are skipped by routing. A run that hits a model error marks the model, emits `MODEL`,
+dispatches the research task detached, and re-routes the task once without that model.
 
 **CONTEXT.md / HANDOFF.md** — free markdown. HANDOFF should carry these headings so any agent can
 skim it: `## Status` (`END` or `BLOCKED`), `## What changed`, `## Open questions`, `## Next step`.
@@ -85,9 +99,10 @@ vendor JSON output (`"input_tokens"`, `"output_tokens"`, `"total_cost_usd"`). An
 usage with `deck usage add`.
 
 **EVENT** — `{"ts", "type", "task", "hand", "by", "msg", ...}`. Types: `TASK` `CLAIM` `RELEASE`
-`START` `END` `BLOCKED` `FAILED` `COOLDOWN` `AUTH` `ACCOUNT` `HAND` `NOTE`. `AUTH` fires when an
+`START` `END` `BLOCKED` `FAILED` `COOLDOWN` `AUTH` `MODEL` `ACCOUNT` `HAND` `NOTE`. `AUTH` fires when an
 account's usability flips (`ok: true|false`) and carries the exact fix (`run: deck account login <id>`);
-it is the event a meta-agent forwards to the human. Free to extend; keep them uppercase and short.
+it is the event a meta-agent forwards to the human. `MODEL` fires when a probe or a run learns a model
+id is (un)available. Free to extend; keep them uppercase and short.
 
 ## 3. Lifecycle
 
@@ -97,6 +112,11 @@ meta: deck run <task>    →  route → claim hand → run hand.cmd in task.cwd 
                              → read HANDOFF.md → release → task.status → emit END | BLOCKED | FAILED
 meta: wake on the event  →  read HANDOFF.md → steer: new task, re-run, or stop
 ```
+
+Parallelism is the number of free hands: `deck route` lists them; `deck run t1 t2 t3 --bg` detaches one
+run per task, each claiming its own hand; `deck wait t1 t2 t3` (or the events) collects them. Sequential
+work is just `deck run` without `--bg`. There is no scheduler — the meta-agent decides how many to
+dispatch by reading headroom, and the claim files make that decision safe across several meta-agents.
 
 The worker is told (in its prompt and via `$DECK_CONTEXT`, `$DECK_HANDOFF`, `$DECK_TASK`) to write
 HANDOFF.md before exiting. If it doesn't, `deck run` writes a stub from the output tail so the
@@ -112,9 +132,10 @@ Workers driven by hand (interactive Claude Code, a human) close the loop with
 
 `deck route [--cost c] [--vendor v]` ranks free hands:
 
-1. exclude claimed, needs-login/down, cooling-down, or exhausted hands (account headroom ≤ 0), and
-   vendor mismatches;
-2. sort by cost-class distance from the requested `cost`, then most remaining headroom fraction,
+1. exclude claimed, needs-login/down/no-model, cooling-down, or exhausted hands (account headroom ≤ 0),
+   and vendor mismatches (a task's `model` implies its vendor via the catalog);
+2. sort by: hand already on the requested model, then overlap of catalog `good_for` with the task's
+   `needs`, then cost-class distance from the requested `cost`, then most remaining headroom fraction,
    then least recently used.
 
 `deck run` claims the first hand whose claim sticks (losing a race to another meta-agent just means

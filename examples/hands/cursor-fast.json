@@ -4,6 +4,7 @@
   "account": "cursor-pro",
   "model": "composer-2.5-fast",
   "cost": "low",
-  "cmd": "cursor-agent -p --force --add-dir {taskdir} --output-format json --model composer-2.5-fast {prompt}",
-  "notes": "Cheap, quick edits. Swap {prompt} for `< {context}` style piping if your context is large."
+  "cmd": "cursor-agent -p --force --add-dir {taskdir} --output-format json{model} {prompt}",
+  "notes": "Cheap, quick edits. {model} expands at run time to the model + effort flags, so `deck run --model/--effort` can override.",
+  "effort": "low"
 }
