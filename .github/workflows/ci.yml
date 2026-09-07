@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.8", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Static checks
+        run: |
+          bash -n install.sh
+          bash -n tests/smoke.sh
+          python -m py_compile deck
+      - name: End-to-end smoke suite
+        run: bash tests/smoke.sh
+      - name: Local installer smoke
+        run: |
+          install_dir="$RUNNER_TEMP/agent-deck-bin"
+          DECK_BIN="$install_dir" sh install.sh
+          test "$("$install_dir/deck" --version)" = "deck 0.4.0"

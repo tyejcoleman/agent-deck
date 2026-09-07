@@ -27,9 +27,14 @@ Read [SPEC.md](SPEC.md) for the protocol (two pages). Everything below is the re
 One file, Python 3.8+, nothing else.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tyejcoleman/agent-deck/main/install.sh | sh
-# or: curl -fsSLo ~/.local/bin/deck https://raw.githubusercontent.com/tyejcoleman/agent-deck/main/deck && chmod +x ~/.local/bin/deck
+curl -fsSL https://raw.githubusercontent.com/tyejcoleman/agent-deck/v0.4.0/install.sh | DECK_VERSION=v0.4.0 sh
+deck --version
 ```
+
+The installer downloads the CLI from the same immutable tag and verifies its SHA-256 digest before
+replacing an existing binary. Release assets include `deck`, `install.sh`, and `SHA256SUMS`. To install
+another release, set both tag occurrences to that version. `DECK_URL` and `DECK_SHA256` are available
+for audited mirrors.
 
 Works on a Mac, a VPS, a box under your desk. Hosting the deck = wherever the folder lives; sync it
 with git, SSH, or Syncthing and every machine sees the same roster.
