@@ -9,4 +9,5 @@
 - Isolate vendor logins and keep credentials outside the portable `.deck/` protocol directory.
 - Add portable end-to-end coverage for macOS and Linux, including account, routing, recovery,
   concurrency, usage, and MCP behavior.
+- Serialize per-hand claims so concurrent detached tasks cannot erase or share one another's lease.
 - Pin release installation and verify the CLI checksum before replacement.

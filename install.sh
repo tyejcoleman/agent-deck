@@ -3,7 +3,7 @@
 set -eu
 
 VERSION="${DECK_VERSION:-v0.4.0}"
-EXPECTED_SHA256="${DECK_SHA256:-96491f9e115e34b42fabb4507fbfa9d060497be4f64628d6d0dd0c8cf1cd5d85}"
+EXPECTED_SHA256="${DECK_SHA256:-a2a0820a3beabb322d99364ad10592e06b9a467d0386eb3e24e8b05b3dfe9b2e}"
 BIN="${DECK_BIN:-$HOME/.local/bin}"
 URL="${DECK_URL:-https://raw.githubusercontent.com/tyejcoleman/agent-deck/$VERSION/deck}"
 TMP="$BIN/.deck-install.$$"

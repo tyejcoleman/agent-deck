@@ -7,6 +7,7 @@ Zero dependencies. Python 3.8+. Copy it anywhere on PATH.
 import argparse
 import contextlib
 import datetime as dt
+import fcntl
 import getpass
 import hashlib
 import io
@@ -758,6 +759,18 @@ def claim_of(deck, hand):
     return c if not c.get("until") or ts(c["until"]) > now() else None
 
 
+@contextlib.contextmanager
+def claim_lock(deck, hand):
+    """Serialize claim-file inspection and replacement across local deck processes."""
+    lock = deck.p("claims", ".%s.lock" % hand)
+    with open(str(lock), "a+", encoding="utf-8") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
 def alive(pid):
     try:
         os.kill(int(pid), 0)
@@ -822,27 +835,30 @@ def route(deck, cost=None, vendor=None, needs=(), model=None):
 
 
 def do_claim(deck, hand, task, by, ttl):
-    c = claim_of(deck, hand)
-    if c:
-        die("hand %s is claimed by %s (task %s) until %s" % (hand, c["by"], c.get("task"), c.get("until")))
     f = deck.p("claims", hand + ".json")
-    if f.exists():
-        f.unlink()
     rec = {"hand": hand, "task": task, "by": by, "since": iso(now()), "until": iso(now() + dt.timedelta(seconds=dur(ttl)))}
-    try:
+    with claim_lock(deck, hand):
+        c = claim_of(deck, hand)
+        if c:
+            die("hand %s is claimed by %s (task %s) until %s" % (hand, c["by"], c.get("task"), c.get("until")))
+        if f.exists():
+            f.unlink()  # expired claim, inspected while holding the per-hand lock
         fd = os.open(str(f), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-    except FileExistsError:
-        die("hand %s was just claimed by someone else" % hand)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(rec, fh, indent=2)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(rec, fh, indent=2)
     emit(deck, "CLAIM", hand=hand, task=task, by=by)
     return rec
 
 
 def do_release(deck, hand, by, task=None):
     f = deck.p("claims", hand + ".json")
-    if f.exists():
-        f.unlink()
+    released = False
+    with claim_lock(deck, hand):
+        c = claim_of(deck, hand)
+        if f.exists() and (not task or (c and c.get("task") == task)):
+            f.unlink()
+            released = True
+    if released:
         emit(deck, "RELEASE", hand=hand, task=task, by=by)
 
 

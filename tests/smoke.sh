@@ -145,15 +145,27 @@ deck account add pv --vendor custom --auth none >/dev/null
 deck hand add ph --account pv --vendor pvend --model good-1 --cost mid --cmd 'sh -c "cat>/dev/null; case \"\$*\" in *bad-model*) echo \"Error: unknown model: \$*\"; exit 1;; esac; echo {\\\"result\\\":\\\"OK\\\"}" x {model} e={effort}' >/dev/null
 deck task add "dry" --id t15 >/dev/null
 deck run t15 --hand ph --model m9 --effort high --dry | grep -q -- "--model m9 e=high" && pass "run-time --model/--effort expansion" || fail "model/effort expansion"
-for i in 1 2 3; do deck hand add bg$i --account pv --cmd 'sh -c "cat>/dev/null; sleep 2"' >/dev/null; deck task add "bg$i" --id bg$i >/dev/null; done
+cat > bg-worker.sh <<'EOF'
+#!/bin/sh
+cat >/dev/null
+i=0
+while [ ! -f "$DECK_ROOT/bg.release" ] && [ "$i" -lt 200 ]; do
+  sleep 0.05
+  i=$((i + 1))
+done
+test -f "$DECK_ROOT/bg.release"
+EOF
+chmod +x bg-worker.sh
+for i in 1 2 3; do deck hand add bg$i --account pv --cmd "$TMP/bg-worker.sh" >/dev/null; deck task add "bg$i" --id bg$i >/dev/null; done
 deck run bg1 bg2 bg3 --bg >/dev/null
-parallel_running=0
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-  parallel_running="$(deck task ls --status running --json | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')"
-  [ "$parallel_running" = 3 ] && break
+parallel_state="0 0"
+for ((attempt=0; attempt<100; attempt++)); do
+  parallel_state="$(deck task ls --status running --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d), len(set(x.get("hand") for x in d)))')"
+  [ "$parallel_state" = "3 3" ] && break
   sleep 0.05
 done
-[ "$parallel_running" = 3 ] && pass "3 detached runs in parallel" || fail "parallel bg"
+[ "$parallel_state" = "3 3" ] && pass "3 detached runs on 3 hands" || fail "parallel bg"
+touch .deck/bg.release
 expect 0 deck wait bg1 bg2 bg3 --timeout 30s
 pass "wait returns when all finish"
 deck task add "dead" --id t16 >/dev/null
