@@ -23,7 +23,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 COSTS = ("free", "low", "mid", "high")
 HOMES = "~/.config/deck/homes"      # one vendor login dir per account; tokens live there (or the OS keychain), never in .deck/
 SECRETS = "~/.config/deck/secrets"  # 0600 files, used only when no keychain/libsecret is available
@@ -64,10 +64,11 @@ RATE_LIMIT_RE = r"(?i)rate.?limit|usage limit|hit your limit|quota exceeded|too 
 AUTH_FAIL_RE = r"(?i)not logged in|please run /login|run 'agent login'|authentication required|invalid (api )?key|unauthorized|\b401\b|login required|token.{0,20}expired"
 LOGGED_OUT_RE = r"(?i)not logged in|logged out|no credentials|not authenticated"
 MODEL_ERR_RE = r"(?i)(unknown|invalid|unsupported|no such) model|issue with the selected model|model[^\n]{0,60}(not found|does not exist|may not exist|not supported|unavailable|deprecated|not available|is not a valid)|not_found_error[^\n]{0,60}model"
-FINAL = {"END": "done", "BLOCKED": "blocked", "FAILED": "failed"}
+FINAL = {"END": "done", "BLOCKED": "blocked", "FAILED": "failed", "STALE": "stale"}
 
 PROMPT = """You are a worker hand on an Agent Deck. Task {id}: {title}
 Work in the current directory and do what CONTEXT describes.
+{input_contract}
 When finished or blocked, write a handoff file at: {handoff}
 Use exactly these headings: "## Status" (END or BLOCKED), "## What changed", "## Open questions", "## Next step". Then stop.
 
@@ -108,22 +109,23 @@ flight. The files are the protocol; the `deck` CLI is a convenience. Full spec: 
 
 - accounts/<id>.json   vendor + auth mode + rate windows + env + last auth check (never secrets)
 - hands/<id>.json      worker preset: vendor, account, model, cmd, cost class, price
-- tasks/<id>/          task.json, CONTEXT.md (what the worker needs), HANDOFF.md (what it left), runs/*.log
+- tasks/<id>/          task.json, CONTEXT.md, HANDOFF.md, optional immutable-input RECEIPT.json, runs/*.log
 - claims/<hand>.json   who holds a hand right now (expires at `until`)
 - ledger.jsonl         usage per run: units, tokens, seconds, cost
-- events.jsonl         append-only decklog: TASK CLAIM START END BLOCKED FAILED COOLDOWN AUTH MODEL NOTE
+- events.jsonl         append-only decklog: TASK SEAL CLAIM START END BLOCKED FAILED STALE COOLDOWN AUTH MODEL NOTE
 - models.json          catalog for YOUR providers: availability (live-synced), good_for tags, efforts (weekly research task)
 - hooks.d/             executables named <TYPE>-* or any-* run on each event (wake meta-agents)
 
 META-AGENT (Cos, OpenClaw, Grok bot, human):
   deck status                    what's free / claimed / exhausted / needs-login, headroom per account
   deck task add "title"          then edit tasks/<id>/CONTEXT.md
-  deck run <task> [--hand H]     route -> claim -> run hand -> ledger -> HANDOFF.md -> END|BLOCKED event
+  deck task seal <id> --revision HEAD [--artifact FILE]  immutable review inputs, after CONTEXT is final
+  deck run <task> [--hand H]     verify -> route -> run -> verify -> receipt + ledger -> END|BLOCKED|STALE
        [--model M --effort E]    on-the-fly model/effort (see: deck models)
   deck run t1 t2 t3 --bg         parallel: one free hand per task, detached; then: deck wait t1 t2 t3
   deck models                    catalog for your providers (AVAIL, good_for, efforts); stale -> deck models refresh --run
   deck events -f                 wake on END/BLOCKED/AUTH/MODEL, read HANDOFF.md, steer the next task
-  Parallelism = free hands (deck route). Budget = headroom in deck status (% of window / $ / tokens).
+  Parallelism = free hands (deck route). Budget = remaining headroom in deck status (% left / $ / tokens).
   Run concurrent tasks on DIFFERENT repos (or disjoint files): two hands editing one working tree race each other.
   deck <command> --json          machine output
 
@@ -144,6 +146,7 @@ ACCOUNTS (agents set them up; only humans log in):
 WORKER (Claude Code, Codex, Cursor, Gemini) started by `deck run`:
   read $DECK_CONTEXT, do the work, write $DECK_HANDOFF with headings
   "## Status" (END|BLOCKED) "## What changed" "## Open questions" "## Next step", then exit.
+  If $DECK_INPUT_DIGEST is set, the result is bound to that sealed input. Changing the input makes it STALE.
   Manual close: deck handoff <task> --status END --text "..."
 
 Rules: files first. Never store secrets here. Cut anything nobody reads.
@@ -227,7 +230,7 @@ def parse_reset(text):
 
 
 def parse_status(text):
-    m = re.search(r"(?i)status[^A-Za-z]*(END|BLOCKED|FAILED)\b", text or "")
+    m = re.search(r"(?i)status[^A-Za-z]*(END|BLOCKED|FAILED|STALE)\b", text or "")
     return m.group(1).upper() if m else "END"
 
 
@@ -555,6 +558,244 @@ def emit(deck, type_, **kw):
         except Exception as e:  # hooks must never break the deck
             print("deck: hook %s failed: %s" % (h.name, e), file=sys.stderr)
     return ev
+
+
+# ---------- immutable task inputs ----------
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(str(path), "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def canonical_digest(obj):
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def git_read(cwd, *args):
+    r = subprocess.run(["git", "-C", str(cwd)] + list(args), capture_output=True, text=True)
+    if r.returncode:
+        raise ValueError((r.stderr or r.stdout or "git command failed").strip())
+    return r.stdout.strip()
+
+
+def seal_task_input(deck, task, revision=None, artifacts=()):
+    """Capture a clean Git revision and/or file digests after CONTEXT.md is final."""
+    if task.get("input"):
+        die("task %s is already sealed; create a new task instead of rewriting its evidence identity" % task["id"])
+    if task.get("runs", 0):
+        die("task %s has run already; create a new task instead of rewriting its evidence identity" % task["id"])
+    cwd = Path(task.get("cwd") or deck.root.parent).resolve()
+    manifest = {"cwd": str(cwd), "context_sha256": file_sha256(deck.p("tasks", task["id"], "CONTEXT.md")), "artifacts": []}
+    if revision:
+        try:
+            repo = Path(git_read(cwd, "rev-parse", "--show-toplevel")).resolve()
+            expected = git_read(repo, "rev-parse", "--verify", "%s^{commit}" % revision)
+            current = git_read(repo, "rev-parse", "HEAD")
+            dirty = git_read(repo, "status", "--porcelain", "--untracked-files=all")
+            if current != expected:
+                die("cannot seal %s: checked out %s, requested %s" % (task["id"], current[:12], expected[:12]))
+            if dirty:
+                die("cannot seal %s: Git worktree is dirty (%s)" % (task["id"], dirty.splitlines()[0]))
+            manifest.update(repo=str(repo), revision=expected, tree=git_read(repo, "rev-parse", "%s^{tree}" % expected), clean=True)
+        except ValueError as e:
+            die("cannot seal %s: %s" % (task["id"], e))
+    for raw in artifacts or ():
+        path = Path(raw)
+        path = path.resolve() if path.is_absolute() else (cwd / path).resolve()
+        if not path.is_file():
+            die("cannot seal %s: artifact is not a file: %s" % (task["id"], path))
+        manifest["artifacts"].append({"path": str(path), "sha256": file_sha256(path)})
+    manifest["artifacts"].sort(key=lambda x: x["path"])
+    if not manifest.get("revision") and not manifest["artifacts"]:
+        die("cannot seal %s without a Git revision or at least one artifact" % task["id"])
+    manifest["digest"] = canonical_digest(manifest)
+    manifest["sealed_at"] = iso(now())
+    task["input"] = manifest
+    deck.save(task, "tasks", task["id"], "task.json")
+    return manifest
+
+
+def inspect_task_input(deck, task):
+    """Return current/stale/unbound without mutating history; safe for status and MCP reads."""
+    bound = task.get("input")
+    checked = iso(now())
+    if not isinstance(bound, dict):
+        return {"state": "unbound", "checked_at": checked, "issues": []}
+    issues, current_revision, current_tree = [], None, None
+    signed = {k: v for k, v in bound.items() if k not in ("digest", "sealed_at")}
+    if canonical_digest(signed) != bound.get("digest"):
+        issues.append("input manifest digest does not match")
+    cwd = str(Path(task.get("cwd") or deck.root.parent).resolve())
+    if cwd != bound.get("cwd"):
+        issues.append("task cwd changed (expected %s, current %s)" % (bound.get("cwd"), cwd))
+    if bound.get("revision"):
+        try:
+            repo = Path(bound.get("repo") or cwd).resolve()
+            current_revision = git_read(repo, "rev-parse", "HEAD")
+            current_tree = git_read(repo, "rev-parse", "HEAD^{tree}")
+            if current_revision != bound["revision"]:
+                issues.append("Git revision changed (expected %s, current %s)" % (bound["revision"][:12], current_revision[:12]))
+            if current_tree != bound.get("tree"):
+                issues.append("Git tree changed (expected %s, current %s)" % (str(bound.get("tree"))[:12], current_tree[:12]))
+            dirty = git_read(repo, "status", "--porcelain", "--untracked-files=all")
+            if bound.get("clean") and dirty:
+                issues.append("Git worktree is dirty (%s)" % dirty.splitlines()[0])
+        except (OSError, ValueError) as e:
+            issues.append("Git input unavailable (%s)" % e)
+    context = deck.p("tasks", task["id"], "CONTEXT.md")
+    if not context.is_file():
+        issues.append("CONTEXT.md is missing")
+    elif file_sha256(context) != bound.get("context_sha256"):
+        issues.append("CONTEXT.md changed")
+    for artifact in bound.get("artifacts") or []:
+        path = Path(artifact.get("path", ""))
+        if not path.is_file():
+            issues.append("artifact missing: %s" % path)
+        elif file_sha256(path) != artifact.get("sha256"):
+            issues.append("artifact changed: %s" % path)
+    receipt_path = deck.p("tasks", task["id"], "RECEIPT.json")
+    if receipt_path.exists():
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if not isinstance(receipt, dict):
+                raise ValueError("expected a JSON object")
+        except (OSError, ValueError) as e:
+            receipt = None
+            issues.append("receipt is unreadable (%s)" % e)
+        if receipt:
+            if receipt.get("input_digest") != bound.get("digest"):
+                issues.append("receipt input digest does not match")
+            for label, path_key, digest_key in (("handoff", "handoff_path", "handoff_sha256"),
+                                                ("run log", "run_log_path", "run_log_sha256")):
+                raw_path, expected = receipt.get(path_key), receipt.get(digest_key)
+                if not raw_path and not expected and label == "run log":
+                    continue  # a manual handoff has no worker log
+                path = Path(raw_path or "")
+                if not raw_path or not expected:
+                    issues.append("receipt is missing %s identity" % label)
+                elif not path.is_file():
+                    issues.append("%s missing: %s" % (label, path))
+                elif file_sha256(path) != expected:
+                    issues.append("%s changed: %s" % (label, path))
+    return {"state": "stale" if issues else "current", "checked_at": checked, "input_digest": bound.get("digest"),
+            "expected_revision": bound.get("revision"), "current_revision": current_revision, "current_tree": current_tree, "issues": issues}
+
+
+def task_view(deck, task):
+    view = dict(task)
+    check = inspect_task_input(deck, task)
+    view["input_state"], view["input_check"] = check["state"], check
+    if check["state"] == "stale" and view.get("status") in ("open", "done"):
+        view["status"] = "stale"
+    receipt = deck.p("tasks", task["id"], "RECEIPT.json")
+    if receipt.exists():
+        try:
+            parsed = json.loads(receipt.read_text(encoding="utf-8"))
+            view["receipt"] = parsed if isinstance(parsed, dict) else {"error": "expected a JSON object"}
+        except (OSError, ValueError) as e:
+            view["receipt"] = {"error": str(e)}
+    return view
+
+
+def replacement_commands(deck, task):
+    """Exact, collision-free recovery commands for an immutable task that cannot be reused."""
+    base, candidate, n = task["id"] + "-next", task["id"] + "-next", 2
+    while deck.p("tasks", candidate, "task.json").exists():
+        candidate, n = base + str(n), n + 1
+    cwd = str(Path(task.get("cwd") or deck.root.parent).resolve())
+    context = str(deck.p("tasks", task["id"], "CONTEXT.md"))
+    add = "deck task add %s --id %s --cwd %s --file %s" % tuple(map(shlex.quote, (task["title"], candidate, cwd, context)))
+    bound = task.get("input") or {}
+    commands = []
+    if bound.get("repo"):
+        try:
+            if git_read(bound["repo"], "status", "--porcelain", "--untracked-files=all"):
+                commands.extend(["git -C %s status --short" % shlex.quote(str(bound["repo"])),
+                                 "# First commit the intended change or revert it; continue only when status is empty."])
+        except (OSError, ValueError):
+            pass
+    seal = "deck task seal %s" % shlex.quote(candidate)
+    if bound.get("revision"):
+        seal += " --revision HEAD"
+    for artifact in bound.get("artifacts") or []:
+        seal += " --artifact %s" % shlex.quote(str(artifact["path"]))
+    return commands + [add, seal]
+
+
+def task_show_text(deck, task, context, handoff):
+    check = task["input_check"]
+    lines = ["%s — %s" % (task["id"], task["title"]), "status: %s" % task["status"].upper()]
+    if check["state"] == "current":
+        verified = (task.get("receipt") or {}).get("verified_after")
+        lines.append("evidence: %s%s" % (input_summary(check), " · verified %s" % verified if verified else ""))
+        lines.append("next: %s" % ("read the handoff below" if handoff else "run: deck run %s" % shlex.quote(task["id"])))
+    elif check["state"] == "stale":
+        lines.append("evidence: %s" % input_summary(check))
+        lines.extend("reason: %s" % issue for issue in check["issues"])
+        lines.append("next: create a replacement task; this evidence identity cannot be reused")
+        lines.extend("  %s" % command for command in replacement_commands(deck, task))
+    else:
+        lines.append("evidence: UNBOUND — useful work, not release-readiness evidence")
+        lines.append("next: %s" % ("read the handoff below" if handoff else "seal after CONTEXT is final: deck task seal %s --revision HEAD" % shlex.quote(task["id"])))
+    return "%s\n\n--- HANDOFF.md ---\n%s\n--- CONTEXT.md ---\n%s" % ("\n".join(lines), handoff or "(none)", context or "")
+
+
+def input_summary(check):
+    if check["state"] == "unbound":
+        return "UNBOUND"
+    revision = (check.get("expected_revision") or check.get("input_digest") or "")[:12]
+    if check["state"] == "current":
+        return "current@%s" % revision
+    return "STALE@%s" % revision
+
+
+def inspect_run_input(deck, task, cwd_override=None):
+    check = inspect_task_input(deck, task)
+    bound = task.get("input") or {}
+    if bound and cwd_override and str(Path(cwd_override).resolve()) != bound.get("cwd"):
+        check = dict(check, state="stale", issues=list(check["issues"]) + ["run cwd override does not match sealed cwd"])
+    return check
+
+
+def reject_stale_input(deck, task, check, a=None):
+    commands = replacement_commands(deck, task)
+    msg = "sealed input is stale: %s\ncreate a replacement task:\n  %s" % ("; ".join(check["issues"]), "\n  ".join(commands))
+    ev = emit(deck, "STALE", task=task["id"], by=who(a) if a else "deck", input_digest=check.get("input_digest"), msg=msg)
+    if a:
+        out(a, dict(ev, status="STALE", input_check=check, recovery=commands), "STALE %s: %s" % (task["id"], msg))
+    return 2
+
+
+def write_task_receipt(deck, task, hand, run, status, before, after):
+    handoff = deck.p("tasks", task["id"], "HANDOFF.md")
+    run_log = deck.p("tasks", task["id"], "runs", "%d.log" % run)
+    receipt = {"task": task["id"], "run": run, "hand": hand, "status": status, "input_digest": before.get("input_digest"),
+               "verified_before": before.get("checked_at"), "verified_after": after.get("checked_at"), "input_state": after.get("state"),
+               "revision": (task.get("input") or {}).get("revision"), "tree": (task.get("input") or {}).get("tree"),
+               "artifacts": (task.get("input") or {}).get("artifacts") or [], "issues": after.get("issues") or [],
+               "handoff_path": str(handoff), "handoff_sha256": file_sha256(handoff)}
+    if run_log.is_file():
+        receipt.update(run_log_path=str(run_log), run_log_sha256=file_sha256(run_log))
+    deck.save(receipt, "tasks", task["id"], "RECEIPT.json")
+    task.update(reviewed_input_digest=receipt["input_digest"], verified_before=receipt["verified_before"], verified_after=receipt["verified_after"])
+    return receipt
+
+
+def finalize_task_receipt(deck, task, receipt, status, check):
+    """Preserve output hashes while recording the last check after RELEASE hooks have finished."""
+    if not receipt:
+        return
+    receipt.update(status=status, verified_after=check.get("checked_at"), input_state=check.get("state"), issues=check.get("issues") or [])
+    deck.save(receipt, "tasks", task["id"], "RECEIPT.json")
+    task.update(verified_after=receipt["verified_after"])
+
+
+def release_task_claim(deck, task, by):
+    c = claim_of(deck, task["hand"]) if task.get("hand") else None
+    if c and c.get("task") == task["id"]:
+        do_release(deck, task["hand"], by, task["id"])
 
 
 def local_usage(acct, horizon):
@@ -953,10 +1194,12 @@ def cmd_init(a):
         (root / f).touch()
     (root / "AGENTS.md").write_text(AGENTS_MD, encoding="utf-8")
     out(a, {"deck": str(root)}, "deck ready: %s\n"
-        "read:  %s/AGENTS.md\n"
-        "next:  deck account add <id> --vendor claude|codex|cursor|gemini|ollama|lmstudio   (an agent can do this)\n"
-        "       deck account login <id> [--headless]                                       (a human does this)\n"
-        "       deck hand add <id> --account <id> [--model M]" % (root, root))
+        "read: %s/AGENTS.md\n"
+        "next:\n"
+        "  1. deck account add <id> --vendor <vendor>\n"
+        "  2. deck account login <id>       # human login when required\n"
+        "  3. deck hand add <hand> --account <id> --model <model>\n"
+        "then: deck status" % (root, root))
 
 
 def parse_price(s):  # "3/15" -> USD per million tokens in/out
@@ -1104,13 +1347,13 @@ def cmd_account(deck, a):
         refresh_remote(deck, x)
     rows = [dict(x, headroom=headroom(x, ledger)) for x in accts]
 
-    out(a, rows, table(["ACCOUNT", "VENDOR", "AUTH", "STATE", "HEADROOM", "CHECKED", "$/MO", "LOGIN"],
+    out(a, rows, table(["ACCOUNT", "VENDOR", "AUTH", "STATE", "USAGE LEFT", "CHECKED", "$/MO", "LOGIN"],
                        [[r["id"], r.get("vendor", ""), r.get("auth", "?"), auth_state(r) or r["headroom"]["state"], head_text(r["headroom"], r),
                          (r.get("check") or {}).get("at", "never")[:16], r.get("monthly_usd") or "-", r.get("login", "")] for r in rows]) if rows else "no accounts")
 
 
 def head_text(hr, acct=None):
-    """The number that matters per billing kind: % of window for subscriptions, $ for API, tokens for local."""
+    """Remaining-first budget text. Raw JSON retains both `used` and `frac`."""
     if not hr:
         return "-"
     auth, w = (acct or {}).get("auth", "none"), hr["window"]
@@ -1118,15 +1361,15 @@ def head_text(hr, acct=None):
     if hr.get("limit"):
         if hr.get("metric") == "%":
             age = hr.get("reading_age") or 0
-            core = "%s%d%% of %s (%s%s)" % ("≈" if hr.get("est") else "", round(hr["used"]), w, hr.get("source", "vendor"), " %s ago" % fdur(age) if age > 120 else "")
+            core = "%s%d%% left of %s (%s%s)" % ("≈" if hr.get("est") else "", round(100 - hr["used"]), w, hr.get("source", "vendor"), " %s ago" % fdur(age) if age > 120 else "")
         else:
-            core = "%d%% of %s" % (round(100 * hr["used"] / hr["limit"]), w) + (" (synced)" if hr.get("remote") else "")
+            core = "%d%% left of %s" % (round(100 * hr["frac"]), w) + (" (synced)" if hr.get("remote") else "")
         return core + (" · $%.2f" % hr["usd"] if auth == "apikey" else " · " + tok if hr.get("requests") is not None else "")
     if auth == "apikey":
-        return "$%.2f in %s" % (hr.get("usd", 0), w)
+        return "no limit · $%.2f used in %s" % (hr.get("usd", 0), w)
     if hr.get("source") == "logs":
-        return "%s in %s (all sessions)" % (tok, w)
-    return tok + " in %s" % w if auth == "none" else "%s runs in %s" % (hr.get("runs", hr["used"]), w)
+        return "no limit · %s used in %s" % (tok, w)
+    return "no limit · %s used in %s" % (tok, w) if auth == "none" else "no limit · %s runs in %s" % (hr.get("runs", hr["used"]), w)
 
 
 def cmd_hand(deck, a):
@@ -1163,10 +1406,14 @@ def cmd_hand(deck, a):
 def cmd_status(deck, a):
     ro, counts = roster(deck), {}
     accts = {x["id"]: x for x in deck.items("accounts")}
-    for t in deck.items("tasks"):
+    task_views = [task_view(deck, t) for t in deck.items("tasks")]
+    for t in task_views:
         counts[t["status"]] = counts.get(t["status"], 0) + 1
     if a.json:
-        return out(a, {"deck": str(deck.root), "hands": ro, "tasks": counts})
+        return out(a, {"deck": str(deck.root), "hands": ro, "tasks": counts, "task_inputs": {
+            "current": sum(t["input_state"] == "current" for t in task_views),
+            "stale": sum(t["input_state"] == "stale" for t in task_views),
+            "unbound": sum(t["input_state"] == "unbound" for t in task_views)}})
     rows = []
     for h in ro:
         hr, c = h["headroom"] or {}, h["claim"]
@@ -1181,8 +1428,11 @@ def cmd_status(deck, a):
         rows.append([h["id"], h.get("model") or "-", h.get("account", ""), h.get("cost", ""),
                      ("%s$%.2f/%dk" % ("" if ob["metered"] else "≈", ob["avg_usd"], ob["avg_tokens"] / 1000) if ob["avg_usd"] else "%dk tok" % (ob["avg_tokens"] / 1000)) if ob else "-",
                      h["state"], head_text(hr, accts.get(h.get("account"))), note])
-    print(table(["HAND", "MODEL", "ACCOUNT", "COST", "OBSERVED", "STATE", "HEADROOM", "NOTE"], rows) if rows else "no hands (deck hand add ...)")
+    print(table(["HAND", "MODEL", "ACCOUNT", "COST", "OBSERVED", "STATE", "USAGE LEFT", "NOTE"], rows) if rows else "no hands (deck hand add ...)")
     print("tasks: " + (", ".join("%s %d" % kv for kv in sorted(counts.items())) or "none"))
+    if task_views:
+        print("inputs: current %d, stale %d, unbound %d" % (sum(t["input_state"] == "current" for t in task_views),
+              sum(t["input_state"] == "stale" for t in task_views), sum(t["input_state"] == "unbound" for t in task_views)))
     upd = deck.models().get("updated")
     if ro and (not upd or (now() - ts(upd)).total_seconds() > 7 * 86400):
         print("model notes %s -> deck models refresh --run" % ("never refreshed" if not upd else "%d days old" % ((now() - ts(upd)).days)))
@@ -1203,7 +1453,7 @@ def why_no_hand(deck):
 
 def cmd_route(deck, a):
     ranked = route(deck, a.cost, a.vendor)
-    out(a, ranked, table(["#", "HAND", "COST", "HEADROOM", "LAST USED"],
+    out(a, ranked, table(["#", "HAND", "COST", "USAGE LEFT", "LAST USED"],
                          [[i + 1, h["id"], h.get("cost", ""), "%d%%" % round(h["headroom"]["frac"] * 100), h.get("last_used") or "never"]
                           for i, h in enumerate(ranked)]) if ranked else why_no_hand(deck))
     return 0 if ranked else 2
@@ -1224,25 +1474,45 @@ def cmd_task(deck, a):
             rec["cwd"] = str(Path(a.cwd).resolve())
         deck.save(rec, "tasks", tid, "task.json")
         deck.p("tasks", tid, "CONTEXT.md").write_text(read_text_arg(a) or CONTEXT_MD.format(title=a.title), encoding="utf-8")
+        if a.revision or a.artifact:
+            try:
+                seal_task_input(deck, rec, a.revision, a.artifact or [])
+            except SystemExit:
+                shutil.rmtree(str(deck.p("tasks", tid)), ignore_errors=True)
+                raise
         emit(deck, "TASK", task=tid, by=who(a), msg=a.title)
         return out(a, rec, tid)
+    if a.sub == "seal":
+        task = deck.load("tasks", a.id, "task.json")
+        revision = a.revision or (None if a.artifact else "HEAD")
+        manifest = seal_task_input(deck, task, revision, a.artifact or [])
+        emit(deck, "SEAL", task=task["id"], by=who(a), input_digest=manifest["digest"], revision=manifest.get("revision"))
+        return out(a, manifest, "sealed %s at %s" % (task["id"], (manifest.get("revision") or manifest["digest"])[:12]))
     if a.sub == "show":
-        t = deck.load("tasks", a.id, "task.json")
+        t = task_view(deck, deck.load("tasks", a.id, "task.json"))
         ctx, hf = (deck.p("tasks", a.id, n) for n in ("CONTEXT.md", "HANDOFF.md"))
         t["context"], t["handoff"] = (f.read_text(encoding="utf-8") if f.exists() else None for f in (ctx, hf))
-        return out(a, t, "%s\n\n--- CONTEXT.md ---\n%s\n--- HANDOFF.md ---\n%s" % (json.dumps({k: v for k, v in t.items() if k not in ("context", "handoff")}, indent=2), t["context"] or "", t["handoff"] or "(none)"))
+        return out(a, t, task_show_text(deck, t, t["context"], t["handoff"]))
     if a.sub == "set":
         t = deck.load("tasks", a.id, "task.json")
+        if t.get("input"):
+            die("task %s is sealed; create a replacement task instead:\n  %s" % (a.id, "\n  ".join(replacement_commands(deck, t))))
+        reserved = {"id", "created", "input", "runs", "hand", "pid", "started", "finished",
+                    "reviewed_input_digest", "verified_before", "verified_after"}
         for kv in a.kv:
             k, v = kv.split("=", 1)
+            if k in reserved:
+                die("task field %s is managed by deck and cannot be set" % k)
             try:
                 t[k] = json.loads(v)
             except ValueError:
                 t[k] = v
         deck.save(t, "tasks", a.id, "task.json")
         return out(a, t, "updated %s" % a.id)
-    rows = [t for t in deck.items("tasks") if not a.status or t["status"] in a.status.split(",")]
-    out(a, rows, table(["TASK", "STATUS", "HAND", "RUNS", "TITLE"], [[t["id"], t["status"], t.get("hand") or "-", t.get("runs", 0), t["title"]] for t in rows]) if rows else "no tasks")
+    rows = [task_view(deck, t) for t in deck.items("tasks")]
+    rows = [t for t in rows if not a.status or t["status"] in a.status.split(",")]
+    out(a, rows, table(["TASK", "STATUS", "INPUT", "HAND", "RUNS", "TITLE"],
+                       [[t["id"], t["status"], input_summary(t["input_check"]), t.get("hand") or "-", t.get("runs", 0), t["title"]] for t in rows]) if rows else "no tasks")
 
 
 def cmd_claim(deck, a):
@@ -1259,15 +1529,25 @@ def spawn_runs(deck, a):
     """Detach one `deck run` per task; each claims its own hand, so N tasks on N free hands run in parallel."""
     flags = [x for k in ("hand", "cost", "vendor", "model", "effort", "cwd", "ttl", "timeout", "by") if getattr(a, k) for x in ("--" + k, getattr(a, k))]
     pids = []
+    tasks = []
     for tid in a.task:
-        deck.load("tasks", tid, "task.json")
+        task = deck.load("tasks", tid, "task.json")
+        if task.get("input") and (task.get("runs", 0) or deck.p("tasks", task["id"], "RECEIPT.json").exists()):
+            die("sealed task %s already has a result; create a replacement task instead:\n  %s" %
+                (task["id"], "\n  ".join(replacement_commands(deck, task))))
+        check = inspect_run_input(deck, task, a.cwd)
+        if check["state"] == "stale":
+            return reject_stale_input(deck, task, check, a)
+        tasks.append(task)
+    for task in tasks:
+        tid = task["id"]
         log = deck.p("tasks", tid, "runs")
         log.mkdir(exist_ok=True)
         with open(str(log / "bg.log"), "a", encoding="utf-8") as fh:
             p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "run", tid, "--json"] + flags + (["--force"] if a.force else []),
                                  stdout=fh, stderr=fh, stdin=subprocess.DEVNULL, start_new_session=True, env=dict(os.environ, DECK_ROOT=str(deck.root)))
         pids.append({"task": tid, "pid": p.pid})
-    out(a, pids, "\n".join("started %s (pid %d) - wake on: deck events -f --type END,BLOCKED,FAILED ; or: deck wait %s" % (p["task"], p["pid"], p["task"]) for p in pids))
+    out(a, pids, "\n".join("started %s (pid %d) - wake on: deck events -f --type END,BLOCKED,FAILED,STALE ; or: deck wait %s" % (p["task"], p["pid"], p["task"]) for p in pids))
 
 
 def cmd_run(deck, a):
@@ -1276,6 +1556,12 @@ def cmd_run(deck, a):
     task = deck.load("tasks", a.task[0], "task.json")
     if task["status"] == "running" and not a.force:
         die("task %s is already running (use --force)" % task["id"])
+    if task.get("input") and (task.get("runs", 0) or deck.p("tasks", task["id"], "RECEIPT.json").exists()):
+        die("sealed task %s already has a result; create a replacement task instead:\n  %s" %
+            (task["id"], "\n  ".join(replacement_commands(deck, task))))
+    input_before = inspect_run_input(deck, task, a.cwd)
+    if input_before["state"] == "stale":
+        return reject_stale_input(deck, task, input_before, a)
     by = who(a)
     model = a.model or task.get("model")
     vendor = a.vendor or (deck.models().get("models", {}).get(model) or {}).get("vendor") if model and not a.hand else a.vendor
@@ -1313,7 +1599,11 @@ def cmd_run(deck, a):
     acct = deck.load("accounts", hand["account"] + ".json")
     tdir = deck.p("tasks", task["id"])
     ctx, hf = tdir / "CONTEXT.md", tdir / "HANDOFF.md"
-    prompt = PROMPT.format(id=task["id"], title=task["title"], handoff=hf, context=ctx.read_text(encoding="utf-8") if ctx.exists() else task["title"])
+    contract_text = ("INPUT CONTRACT (immutable): digest %s; revision %s. Validate only these inputs; do not describe a later revision."
+                     % (input_before.get("input_digest"), input_before.get("expected_revision") or "artifact-bound")) if input_before["state"] == "current" else \
+                    "INPUT CONTRACT: UNBOUND. This result is not release-readiness evidence."
+    prompt = PROMPT.format(id=task["id"], title=task["title"], handoff=hf, input_contract=contract_text,
+                           context=ctx.read_text(encoding="utf-8") if ctx.exists() else task["title"])
     model, effort = model or hand.get("model"), a.effort or task.get("effort") or hand.get("effort")
     if (a.model or a.effort) and "{model}" not in hand["cmd"] and "{effort}" not in hand["cmd"]:
         print("deck: hand %s has a fixed cmd (no {model} placeholder); --model/--effort ignored. Regenerate: deck hand add %s --cmd default" % (hand["id"], hand["id"]), file=sys.stderr)
@@ -1328,12 +1618,20 @@ def cmd_run(deck, a):
     if a.dry:
         return out(a, {"hand": hand["id"], "model": model, "effort": effort, "cwd": cwd, "cmd": cmd, "stdin": stdin},
                    "hand: %s  model: %s  effort: %s\ncwd:  %s\ncmd:  %s%s" % (hand["id"], model or "-", effort or "-", cwd, cmd, "\n--- stdin ---\n" + stdin if stdin else ""))
+    input_before_start = inspect_run_input(deck, task, a.cwd)
+    if input_before_start["state"] == "stale":
+        do_release(deck, hand["id"], by, task["id"])
+        return reject_stale_input(deck, task, input_before_start, a)
+    input_before = input_before_start
     task.update(status="running", hand=hand["id"], runs=task.get("runs", 0) + 1, pid=os.getpid(), started=iso(now()))
     deck.save(task, "tasks", task["id"], "task.json")
     n = task["runs"]
-    emit(deck, "START", task=task["id"], hand=hand["id"], by=by, run=n, model=model, effort=effort)
+    emit(deck, "START", task=task["id"], hand=hand["id"], by=by, run=n, model=model, effort=effort,
+         input_state=input_before["state"], input_digest=input_before.get("input_digest"))
     env = dict(os.environ, **acct_env(acct))
     env.update(DECK_ROOT=str(deck.root), DECK_TASK=task["id"], DECK_HAND=hand["id"], DECK_CONTEXT=str(ctx), DECK_HANDOFF=str(hf))
+    if input_before.get("input_digest"):
+        env["DECK_INPUT_DIGEST"] = input_before["input_digest"]
     before, t0, msg = hf.stat().st_mtime if hf.exists() else 0, time.time(), None
     try:
         p = subprocess.run(cmd, shell=True, cwd=cwd, input=stdin, capture_output=True, env=env,
@@ -1389,16 +1687,34 @@ def cmd_run(deck, a):
     if not wrote:
         hf.write_text(HANDOFF_MD.format(status="%s (auto: worker exited %d without writing a handoff)" % (status, code),
                                         body="Output tail:\n\n```\n%s\n```" % result_text(output)), encoding="utf-8")
-    deck.append("ledger.jsonl", dict({"ts": iso(now()), "account": acct["id"], "hand": hand["id"], "model": model, "task": task["id"], "run": n,
-                                      "units": 1, "seconds": secs, "exit": code}, **usage))
-    ev = finish(deck, task, status, by, run=n, seconds=secs, exit=code, msg=msg, **{k: v for k, v in usage.items() if k != "billing"})
+    input_after = inspect_run_input(deck, task, a.cwd)
+    receipt = None
+    if input_before["state"] == "current":
+        if input_after["state"] == "stale" and status == "END":
+            status, msg = "STALE", "sealed input changed during the run: %s" % "; ".join(input_after["issues"])
+        receipt = write_task_receipt(deck, task, hand["id"], n, status, input_before, input_after)
+    release_task_claim(deck, task, by)
+    terminal_input = inspect_run_input(deck, task, a.cwd)
+    if input_before["state"] == "current" and terminal_input["state"] == "stale" and status == "END":
+        status, msg = "STALE", "sealed evidence changed before the terminal event: %s" % "; ".join(terminal_input["issues"])
+    input_after = terminal_input
+    finalize_task_receipt(deck, task, receipt, status, input_after)
+    ledger = {"ts": iso(now()), "account": acct["id"], "hand": hand["id"], "model": model, "task": task["id"], "run": n,
+              "units": 1, "seconds": secs, "exit": code, "input_state": input_after["state"]}
+    if input_before.get("input_digest"):
+        ledger["input_digest"] = input_before["input_digest"]
+    deck.append("ledger.jsonl", dict(ledger, **usage))
+    ev = finish(deck, task, status, by, run=n, seconds=secs, exit=code, msg=msg, input_digest=input_before.get("input_digest"),
+                verified_before=input_before.get("checked_at"), verified_after=input_after.get("checked_at"),
+                input_state=input_after.get("state"),
+                **{k: v for k, v in usage.items() if k != "billing"})
     out(a, dict(ev, handoff=str(hf), log=str(tdir / "runs" / ("%d.log" % n))),
         "%s %s on %s (%s, exit %d%s)\nhandoff: %s" % (status, task["id"], hand["id"], fdur(secs), code, "; " + msg if msg else "", hf))
     if msg and msg.startswith("model ") and not getattr(a, "_probe", False) and not task["id"].startswith("models-refresh"):
         retry = recover_model(deck, a, task)
         if retry is not None:
             return retry
-    return {"END": 0, "BLOCKED": 2, "FAILED": 1}[status]
+    return {"END": 0, "BLOCKED": 2, "FAILED": 1, "STALE": 2}[status]
 
 
 def recover_model(deck, a, task):
@@ -1425,7 +1741,7 @@ def cmd_wait(deck, a):
     while pending and time.time() < deadline:
         reap(deck)
         for tid in list(pending):
-            t = deck.load("tasks", tid, "task.json")
+            t = task_view(deck, deck.load("tasks", tid, "task.json"))
             if t["status"] not in ("open", "running"):
                 results[tid] = t
                 pending.remove(tid)
@@ -1527,6 +1843,12 @@ def probe_model(deck, a):
 
 def cmd_handoff(deck, a):
     task = deck.load("tasks", a.task, "task.json")
+    if task.get("input") and (task.get("runs", 0) or deck.p("tasks", task["id"], "RECEIPT.json").exists()):
+        die("sealed task %s already has a result; create a replacement task instead:\n  %s" %
+            (task["id"], "\n  ".join(replacement_commands(deck, task))))
+    input_before = inspect_run_input(deck, task)
+    if input_before["state"] == "stale":
+        return reject_stale_input(deck, task, input_before, a)
     hf = deck.p("tasks", a.task, "HANDOFF.md")
     text = read_text_arg(a)
     if a.text:
@@ -1536,8 +1858,23 @@ def cmd_handoff(deck, a):
     if not hf.exists():
         die("no HANDOFF.md for %s; pass --text or --file" % a.task)
     status = a.status or parse_status(hf.read_text(encoding="utf-8"))
-    ev = finish(deck, task, status, who(a), msg=a.text and a.text[:200])
+    input_after = inspect_run_input(deck, task)
+    receipt = None
+    if input_before["state"] == "current":
+        if input_after["state"] == "stale" and status == "END":
+            status = "STALE"
+        receipt = write_task_receipt(deck, task, task.get("hand"), task.get("runs", 0), status, input_before, input_after)
+    release_task_claim(deck, task, who(a))
+    terminal_input = inspect_run_input(deck, task)
+    if input_before["state"] == "current" and terminal_input["state"] == "stale" and status == "END":
+        status = "STALE"
+    input_after = terminal_input
+    finalize_task_receipt(deck, task, receipt, status, input_after)
+    ev = finish(deck, task, status, who(a), msg=a.text and a.text[:200], input_digest=input_before.get("input_digest"),
+                verified_before=input_before.get("checked_at"), verified_after=input_after.get("checked_at"),
+                input_state=input_after.get("state"))
     out(a, ev, "%s %s" % (status, a.task))
+    return 2 if status == "STALE" else 0
 
 
 def cmd_usage(deck, a):
@@ -1606,14 +1943,15 @@ def cmd_event(deck, a):
 MCP_TOOLS = [
     ("deck_status", "Roster: every hand with state (free/claimed/exhausted/cooldown), account headroom, task counts.", ["status"], {}, []),
     ("deck_route", "Rank free hands for a task. cost: low|mid|high preference; vendor: claude|codex|cursor.", ["route"], {"cost": "--cost", "vendor": "--vendor"}, []),
-    ("deck_task_add", "Create a task. title required; context = CONTEXT.md body; cost = free|low|mid|high; needs = comma tags matched to model notes; model/effort defaults; cwd = where the worker runs; id optional.", ["task", "add"], {"title": None, "context": "--text", "cost": "--cost", "needs": "--needs", "model": "--model", "effort": "--effort", "cwd": "--cwd", "id": "--id"}, ["title"]),
-    ("deck_task_ls", "List tasks, optionally filtered by status (open,running,done,blocked,failed).", ["task", "ls"], {"status": "--status"}, []),
-    ("deck_task_show", "Show a task with its CONTEXT.md and HANDOFF.md.", ["task", "show"], {"id": None}, ["id"]),
-    ("deck_run", "Dispatch a task: route (or use hand), claim, run the worker, record ledger, return END/BLOCKED/FAILED. Blocks until the worker exits unless bg=true (then returns a pid; use deck_wait or watch events). model/effort override the hand for this run. timeout like 30m.", ["run"], {"task": None, "hand": "--hand", "cost": "--cost", "vendor": "--vendor", "model": "--model", "effort": "--effort", "timeout": "--timeout", "bg": "--bg!", "by": "--by"}, ["task"]),
-    ("deck_wait", "Block until the given task (id) reaches END/BLOCKED/FAILED; returns its final record. timeout like 20m.", ["wait"], {"task": None, "timeout": "--timeout"}, ["task"]),
+    ("deck_task_add", "Create a task. title required; context = CONTEXT.md body; cost = free|low|mid|high; needs = comma tags matched to model notes; model/effort defaults; cwd = where the worker runs; id optional. revision and repeatable artifact seal immutable review inputs.", ["task", "add"], {"title": None, "context": "--text", "cost": "--cost", "needs": "--needs", "model": "--model", "effort": "--effort", "cwd": "--cwd", "id": "--id", "revision": "--revision", "artifact": "--artifact"}, ["title"]),
+    ("deck_task_seal", "Seal an existing task to an exact clean Git revision and/or repeatable artifact files before its first run. With neither, revision defaults to HEAD.", ["task", "seal"], {"id": None, "revision": "--revision", "artifact": "--artifact"}, ["id"]),
+    ("deck_task_ls", "List tasks, optionally filtered by status (open,running,done,blocked,failed,stale); includes current/stale/unbound input state.", ["task", "ls"], {"status": "--status"}, []),
+    ("deck_task_show", "Show a task with current/stale/unbound input state, its CONTEXT.md, HANDOFF.md, and receipt.", ["task", "show"], {"id": None}, ["id"]),
+    ("deck_run", "Dispatch a task: route (or use hand), validate sealed inputs, claim, run, revalidate, record receipt/ledger, return END/BLOCKED/FAILED/STALE. Blocks until the worker exits unless bg=true (then returns a pid; use deck_wait or watch events). model/effort override the hand for this run. timeout like 30m.", ["run"], {"task": None, "hand": "--hand", "cost": "--cost", "vendor": "--vendor", "model": "--model", "effort": "--effort", "timeout": "--timeout", "bg": "--bg!", "by": "--by"}, ["task"]),
+    ("deck_wait", "Block until the given task (id) reaches END/BLOCKED/FAILED/STALE; returns its final record and input state. timeout like 20m.", ["wait"], {"task": None, "timeout": "--timeout"}, ["task"]),
     ("deck_models", "Model notes used for routing (good_for tags, efforts, cost) and their age. Refresh is a research task: deck_models_refresh.", ["models", "ls"], {}, []),
     ("deck_models_refresh", "If the notes are older than 7 days (or always, if_stale=false), create a cheap research task that updates them; run=true dispatches it detached.", ["models", "refresh"], {"if_stale": "--if-stale!", "run": "--run!"}, []),
-    ("deck_handoff", "Close a task manually: write HANDOFF.md text and emit END or BLOCKED.", ["handoff"], {"task": None, "status": "--status", "text": "--text", "by": "--by"}, ["task"]),
+    ("deck_handoff", "Close a task manually: validate sealed inputs, write HANDOFF.md text, revalidate, write a receipt, and emit END, BLOCKED, or STALE.", ["handoff"], {"task": None, "status": "--status", "text": "--text", "by": "--by"}, ["task"]),
     ("deck_events", "Recent events (decklog). n = count; type = comma list e.g. END,BLOCKED; since like 2h.", ["events"], {"n": "-n", "type": "--type", "since": "--since"}, []),
     ("deck_ledger", "Usage totals per account (runs, tokens, cost, time). account filter; since like 24h.", ["ledger"], {"account": "--account", "since": "--since"}, []),
     ("deck_account_add", "Add/update an account (no secrets). vendor: claude|codex|cursor|gemini|ollama|lmstudio|custom; auth: oauth|apikey|none; limit like 200/5h or 50/1w with metric usd; metric runs|tokens|usd; price IN/OUT USD per 1M tokens; monthly_usd; env KEY=VAL. Afterwards a HUMAN must run `deck account login <id>` - never ask for a key in chat.", ["account", "add"], {"id": None, "vendor": "--vendor", "auth": "--auth", "limit": "--limit", "metric": "--metric", "price": "--price", "monthly_usd": "--monthly-usd", "login": "--login", "env": "--env", "base_url": "--base-url", "key_env": "--key-env"}, ["id"]),
@@ -1632,7 +1970,8 @@ def cmd_mcp(_deck, _a):
         sys.stdout.write(json.dumps(msg) + "\n")
         sys.stdout.flush()
 
-    tools = [{"name": n, "description": d, "inputSchema": {"type": "object", "properties": {p: {"type": "string"} for p in ps}, "required": req}}
+    tools = [{"name": n, "description": d, "inputSchema": {"type": "object", "properties": {
+        p: ({"type": "array", "items": {"type": "string"}} if p == "artifact" else {"type": "string"}) for p in ps}, "required": req}}
              for n, d, _, ps, req in MCP_TOOLS]
     for line in sys.stdin:
         if not line.strip():
@@ -1657,6 +1996,9 @@ def cmd_mcp(_deck, _a):
                     pos.append(str(v))
                 elif flag.endswith("!"):  # boolean switch
                     flags += [flag[:-1]] if str(v).lower() not in ("false", "0", "no") else []
+                elif isinstance(v, list):
+                    for item in v:
+                        flags += [flag, str(item)]
                 else:
                     flags += [flag, str(v)]
             buf, err = io.StringIO(), io.StringIO()
@@ -1735,11 +2077,16 @@ def build_parser():
     p = sp("route", cmd_route, "rank free hands (no side effects)")
     p.add_argument("--cost", choices=COSTS), p.add_argument("--vendor")
 
-    s = group("task", "tasks: add | ls | show | set")
+    s = group("task", "tasks: add | seal | ls | show | set")
     q = sp("add", cmd_task, "create a task + CONTEXT.md", s)
     q.add_argument("title"), q.add_argument("--id"), q.add_argument("--cost", choices=COSTS), q.add_argument("--cwd", help="where the worker runs")
     q.add_argument("--model", help="preferred model (routes to a hand of that vendor)"), q.add_argument("--effort"), q.add_argument("--needs", help="comma list matched against models.json good_for, e.g. reasoning,long-context")
     q.add_argument("--file", help="CONTEXT.md from file ('-' = stdin)"), q.add_argument("--text", help="CONTEXT.md body")
+    q.add_argument("--revision", help="seal to this exact Git ref; the checkout must be clean and currently at that ref")
+    q.add_argument("--artifact", action="append", help="seal to this file's SHA-256 (repeatable; relative to --cwd)")
+    q = sp("seal", cmd_task, "seal an existing unrun task to revision/artifacts", s)
+    q.add_argument("id"), q.add_argument("--revision", help="exact Git ref (default HEAD when no --artifact is given)")
+    q.add_argument("--artifact", action="append", help="file to bind by SHA-256 (repeatable; relative to task cwd)")
     sp("ls", cmd_task, "list tasks", s).add_argument("--status", help="comma list")
     sp("show", cmd_task, "task + CONTEXT + HANDOFF", s).add_argument("id")
     q = sp("set", cmd_task, "set fields: deck task set <id> status=open cost=low", s)
@@ -1752,7 +2099,7 @@ def build_parser():
     p = sp("run", cmd_run, "dispatch task(s) to hands; several tasks or --bg run detached in parallel")
     p.add_argument("task", nargs="+"), p.add_argument("--hand"), p.add_argument("--cost", choices=COSTS), p.add_argument("--vendor")
     p.add_argument("--model", help="override the hand's model for this run"), p.add_argument("--effort", help="low|medium|high|xhigh|max (vendor-mapped; ignored where unsupported)")
-    p.add_argument("--bg", action="store_true", help="detach; wake on END/BLOCKED/FAILED events or `deck wait`")
+    p.add_argument("--bg", action="store_true", help="detach; wake on END/BLOCKED/FAILED/STALE events or `deck wait`")
     p.add_argument("--cwd"), p.add_argument("--ttl", default="2h"), p.add_argument("--timeout", help="e.g. 30m"), p.add_argument("--dry", action="store_true", help="print command, don't run")
     p.add_argument("--force", action="store_true")
 

@@ -2,8 +2,8 @@
 # Installs the `deck` CLI (a single Python 3 file) into ~/.local/bin or $DECK_BIN.
 set -eu
 
-VERSION="${DECK_VERSION:-v0.4.0}"
-EXPECTED_SHA256="${DECK_SHA256:-a2a0820a3beabb322d99364ad10592e06b9a467d0386eb3e24e8b05b3dfe9b2e}"
+VERSION="${DECK_VERSION:-v0.4.1}"
+EXPECTED_SHA256="${DECK_SHA256:-e3e8b217f75c3cd3fe59d1c5bc3e0a7f03a35f7c3321be47b4518f537eefc63f}"
 BIN="${DECK_BIN:-$HOME/.local/bin}"
 URL="${DECK_URL:-https://raw.githubusercontent.com/tyejcoleman/agent-deck/$VERSION/deck}"
 TMP="$BIN/.deck-install.$$"

@@ -270,15 +270,135 @@ open(d + "/sessions/2026/09/07/rollout-1.jsonl", "w").write("\n".join(json.dumps
 EOF2
 deck account add cx --vendor codex --home "$CH" --status-cmd true >/dev/null 2>&1
 [ "$(deck account ls --json | python3 -c 'import json,sys; a=[x for x in json.load(sys.stdin) if x["id"]=="cx"][0]; h=a["headroom"]; print(h["source"], h["window"], h["used"])')" = "codex-rollout 1w 64.0" ] && pass "codex rollout rate_limits snapshot -> windows (tightest governs)" || fail "codex rollout"
+deck account ls | grep '^cx ' | grep -q '36% left of 1w' && pass "account table is remaining-first" || fail "remaining-first headroom"
+
+# ---- immutable review inputs: seal, pre/post/read checks, receipts, and stale surfaces ----
+BOUND_REPO="$TMP/bound-repo"; mkdir -p "$BOUND_REPO"; git -C "$BOUND_REPO" init -q
+git -C "$BOUND_REPO" config user.name Smoke; git -C "$BOUND_REPO" config user.email smoke@example.invalid
+printf 'v1\n' > "$BOUND_REPO/app.txt"; printf 'artifact-v1\n' > "$BOUND_REPO/artifact.txt"
+git -C "$BOUND_REPO" add app.txt artifact.txt; git -C "$BOUND_REPO" commit -qm base
+deck account add boundacct --vendor custom --auth none >/dev/null
+deck hand add boundh --account boundacct --cmd 'python3 -c "import os,sys; sys.stdin.read(); assert len(os.environ[\"DECK_INPUT_DIGEST\"])==64; open(os.environ[\"DECK_HANDOFF\"],\"w\").write(\"## Status\\nEND\\n## What changed\\nverified sealed input\\n\")"' >/dev/null
+deck task add "direct seal" --id bound-direct --cwd "$BOUND_REPO" >/dev/null
+deck task seal bound-direct --revision HEAD --artifact artifact.txt >/dev/null
+[ "$(deck task show bound-direct --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["input_state"])')" = current ] && pass "task seal binds an existing task" || fail "task seal command"
+expect 1 deck task seal bound-direct --revision HEAD
+grep -q 'already sealed' out.txt && pass "sealed evidence identity cannot be rewritten" || fail "sealed identity immutability"
+deck task add "bound current" --id bound-ok --cwd "$BOUND_REPO" --revision HEAD --artifact artifact.txt --text 'verify exact input' >/dev/null
+[ "$(deck task show bound-ok --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["input_state"], len(d["input"]["digest"]))')" = "current 64" ] && pass "task add seals exact revision + artifact" || fail "task add seal"
+expect 0 deck run bound-ok --hand boundh
+python3 - .deck/tasks/bound-ok/task.json .deck/tasks/bound-ok/RECEIPT.json .deck/ledger.jsonl .deck/events.jsonl <<'EOF2'
+import json, sys
+task, receipt = (json.load(open(p)) for p in sys.argv[1:3])
+def rows(path):
+    result = []
+    for line in open(path):
+        try: result.append(json.loads(line))
+        except ValueError: pass
+    return result
+ledger, events = rows(sys.argv[3]), rows(sys.argv[4])
+assert receipt["status"] == "END" and receipt["input_state"] == "current"
+assert receipt["input_digest"] == task["input"]["digest"] == task["reviewed_input_digest"]
+assert receipt["verified_before"] and receipt["verified_after"] and receipt["revision"] and receipt["tree"]
+assert len(receipt["handoff_sha256"]) == 64 and len(receipt["run_log_sha256"]) == 64
+assert [x for x in ledger if x.get("task") == "bound-ok"][-1]["input_digest"] == receipt["input_digest"]
+assert [x for x in events if x.get("task") == "bound-ok" and x["type"] == "END"][-1]["input_state"] == "current"
+EOF2
+pass "successful bound run writes input/output receipt + ledger/event digest"
+deck task show bound-ok | head -4 | grep -q 'evidence: current@' && pass "task show leads with human status + evidence" || fail "human-first task show"
+expect 1 deck run bound-ok --hand boundh
+grep -q 'already has a result' out.txt && grep -q 'deck task add' out.txt && pass "sealed result cannot be overwritten by a rerun" || fail "sealed rerun refusal"
+cp .deck/tasks/bound-ok/HANDOFF.md "$TMP/bound-ok-handoff"
+printf '\nverified later candidate-v2 that was never reviewed\n' >> .deck/tasks/bound-ok/HANDOFF.md
+[ "$(deck task show bound-ok --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["status"], d["input_state"])')" = "stale stale" ] \
+  && pass "post-review handoff rewrite invalidates evidence" || fail "handoff rewrite detection"
+cp "$TMP/bound-ok-handoff" .deck/tasks/bound-ok/HANDOFF.md
+[ "$(deck task show bound-ok --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["status"], d["input_state"])')" = "done current" ] \
+  && pass "restored handoff restores current evidence" || fail "handoff restore"
+cp .deck/tasks/bound-ok/runs/1.log "$TMP/bound-ok-run-log"
+printf '\npost-review log rewrite\n' >> .deck/tasks/bound-ok/runs/1.log
+[ "$(deck task show bound-ok --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["status"], d["input_state"])')" = "stale stale" ] \
+  && pass "post-review run-log rewrite invalidates evidence" || fail "run-log rewrite detection"
+cp "$TMP/bound-ok-run-log" .deck/tasks/bound-ok/runs/1.log
+expect 1 deck task seal bound-ok --revision HEAD
+grep -q 'already sealed' out.txt && pass "completed evidence identity cannot be resealed" || fail "reseal refusal"
+ORIGINAL_DIGEST="$(deck task show bound-direct --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["input"]["digest"])')"
+expect 1 deck task set bound-direct input=null
+[ "$(deck task show bound-direct --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["input_state"], d["input"]["digest"])')" = "current $ORIGINAL_DIGEST" ] \
+  && grep -q 'is sealed' out.txt && pass "task set cannot rewrite sealed identity" || fail "sealed task set bypass"
+deck task add "managed fields" --id managed-set >/dev/null
+expect 1 deck task set managed-set runs=99
+[ "$(deck task show managed-set --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["runs"])')" = 0 ] \
+  && grep -q 'managed by deck' out.txt && pass "task set cannot forge run counters" || fail "managed task field bypass"
+printf 'v2\n' >> "$BOUND_REPO/app.txt"; git -C "$BOUND_REPO" add app.txt; git -C "$BOUND_REPO" commit -qm advance
+[ "$(deck task show bound-ok --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["status"], d["input_state"], bool(d.get("receipt")))')" = "stale stale True" ] \
+  && deck task ls --status stale | grep -q bound-ok && [ "$(deck status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["task_inputs"]["stale"])')" -ge 1 ] \
+  && pass "read-time revision drift is stale across show/list/status" || fail "read-time stale surfaces"
+
+deck task add "preflight stale" --id bound-pre --cwd "$BOUND_REPO" --revision HEAD --artifact artifact.txt >/dev/null
+printf 'artifact-v2\n' >> "$BOUND_REPO/artifact.txt"
+expect 2 deck run bound-pre --hand boundh
+! grep -q '"type": "START", "task": "bound-pre"' .deck/events.jsonl && ! grep -q '"task": "bound-pre"' .deck/ledger.jsonl \
+  && grep -q 'sealed input is stale' out.txt && grep -q 'First commit the intended change or revert it' out.txt \
+  && pass "dirty stale preflight gives prerequisite before replacement commands" || fail "stale preflight"
+expect 1 deck task add "dirty reject" --id bound-dirty --cwd "$BOUND_REPO" --revision HEAD
+[ ! -e .deck/tasks/bound-dirty ] && grep -q 'Git worktree is dirty' out.txt && pass "dirty revision seal is rejected atomically" || fail "dirty seal"
+git -C "$BOUND_REPO" add artifact.txt; git -C "$BOUND_REPO" commit -qm artifact-v2
+
+deck task add "context bound" --id bound-context --cwd "$BOUND_REPO" --revision HEAD >/dev/null
+printf '\nchanged after seal\n' >> .deck/tasks/bound-context/CONTEXT.md
+expect 2 deck run bound-context --hand boundh
+grep -q 'CONTEXT.md changed' out.txt && grep -q 'create a replacement task' out.txt && grep -q 'deck task seal' out.txt \
+  && ! grep -q '"type": "START", "task": "bound-context"' .deck/events.jsonl && pass "context drift fails with exact recovery commands" || fail "context drift"
+
+git -C "$BOUND_REPO" restore artifact.txt
+printf 'claim-v1\n' > "$BOUND_REPO/claim-artifact.txt"; git -C "$BOUND_REPO" add claim-artifact.txt; git -C "$BOUND_REPO" commit -qm claim-artifact
+deck task add "claim drift" --id bound-claim --cwd "$BOUND_REPO" --revision HEAD --artifact claim-artifact.txt >/dev/null
+cat > .deck/hooks.d/CLAIM-drift.sh <<'EOF2'
+#!/bin/sh
+[ "$DECK_TASK" != bound-claim ] || printf 'changed in claim hook\n' >> "$BOUND_REPO/claim-artifact.txt"
+EOF2
+chmod +x .deck/hooks.d/CLAIM-drift.sh
+export BOUND_REPO
+expect 2 deck run bound-claim --hand boundh
+rm .deck/hooks.d/CLAIM-drift.sh
+! grep -q '"type": "START", "task": "bound-claim"' .deck/events.jsonl && ! grep -q '"task": "bound-claim"' .deck/ledger.jsonl \
+  && [ ! -e .deck/claims/boundh.json ] && grep -q 'artifact changed' out.txt \
+  && pass "claim-hook drift is rechecked before START or usage" || fail "claim-hook pre-START check"
+git -C "$BOUND_REPO" restore claim-artifact.txt
+
+deck task add "release drift" --id bound-release --cwd "$BOUND_REPO" --revision HEAD --artifact claim-artifact.txt >/dev/null
+cat > .deck/hooks.d/RELEASE-drift.sh <<'EOF2'
+#!/bin/sh
+[ "$DECK_TASK" != bound-release ] || printf '\nchanged in release hook\n' >> "$DECK_ROOT/tasks/bound-release/HANDOFF.md"
+EOF2
+chmod +x .deck/hooks.d/RELEASE-drift.sh
+expect 2 deck run bound-release --hand boundh
+rm .deck/hooks.d/RELEASE-drift.sh
+[ "$(deck task show bound-release --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["status"], d["input_state"], d["receipt"]["status"])')" = "stale stale STALE" ] \
+  && [ "$(python3 -c 'import json; print(" ".join(x["type"] for x in map(json.loads, open(".deck/events.jsonl")) if x.get("task")=="bound-release" and x["type"] in ("RELEASE","END","STALE")))')" = "RELEASE STALE" ] \
+  && pass "release-hook output drift becomes STALE before terminal event" || fail "release-hook terminal race"
+
+deck hand add mutateh --account boundacct --cmd 'python3 -c "import os,sys; sys.stdin.read(); open(\"artifact.txt\",\"a\").write(\"worker drift\\n\"); open(os.environ[\"DECK_HANDOFF\"],\"w\").write(\"## Status\\nEND\\n## What changed\\nran\\n\")"' >/dev/null
+deck task add "midrun drift" --id bound-mid --cwd "$BOUND_REPO" --artifact artifact.txt >/dev/null
+expect 2 deck run bound-mid --hand mutateh
+[ "$(deck task show bound-mid --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["status"], d["input_state"], d["receipt"]["status"], d["receipt"]["input_state"])')" = "stale stale STALE stale" ] \
+  && grep -q '"type": "STALE", "task": "bound-mid"' .deck/events.jsonl && ! grep -q '"type": "END", "task": "bound-mid"' .deck/events.jsonl \
+  && pass "mid-run drift closes STALE with receipt, never END" || fail "post-run stale receipt"
+[ "$(deck task show t1 --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["input_state"])')" = unbound ] && pass "legacy task is explicitly unbound" || fail "unbound surface"
+deck task add "mcp seal" --id bound-mcp --cwd "$BOUND_REPO" >/dev/null
 
 deck event NOTE --msg hi >/dev/null
 [ "$(deck events --type NOTE -n 1 --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["msg"])')" = hi ] && pass "events filter" || fail "events filter"
 
-printf '%s\n%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"deck_task_ls","arguments":{"status":"done"}}}' \
+printf '%s\n%s\n%s\n%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"deck_task_seal","arguments":{"id":"bound-mcp","artifact":["artifact.txt"]}}}' '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"deck_task_show","arguments":{"id":"bound-mid"}}}' \
   | deck mcp | python3 -c '
 import json,sys
-a,b=[json.loads(l) for l in sys.stdin]
+a,b,c,d=[json.loads(l) for l in sys.stdin]
 assert a["result"]["serverInfo"]["name"]=="agent-deck"
-assert not b["result"]["isError"] and "t1" in b["result"]["content"][0]["text"]' && pass "mcp initialize + tools/call" || fail "mcp initialize + tools/call"
+seal=[x for x in b["result"]["tools"] if x["name"]=="deck_task_seal"][0]
+assert seal["inputSchema"]["properties"]["artifact"]["type"]=="array"
+assert not c["result"]["isError"] and "digest" in c["result"]["content"][0]["text"]
+assert not d["result"]["isError"] and "STALE" in d["result"]["content"][0]["text"] and "input_state" in d["result"]["content"][0]["text"]' && pass "mcp executes seal + exposes stale task state" || fail "mcp seal/stale surface"
 
 echo "all good"

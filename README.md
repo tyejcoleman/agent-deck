@@ -6,14 +6,14 @@ Agent Deck is a thin, open protocol that lets any meta-agent (Cos, OpenClaw, a G
 your coding agents (Claude Code, Codex, Cursor, Gemini CLI, local models, anything with a CLI) as
 *hands*: connect every subscription and API account you have once, see which one has headroom right
 now, dispatch a task to the right hand, and get woken when it ends, blocks, or needs you to log in
-again. It is a directory of JSON + Markdown files, one zero-dependency Python file (~1800 lines), and an optional
+again. It is a directory of JSON + Markdown files, one zero-dependency Python file, and an optional
 MCP mirror. No daemon, no database, no cloud.
 
 ```
 .deck/
   accounts/   every login you own: vendor, auth mode, rate windows, price, last check   (never secrets)
   hands/      named presets: claude-fable, codex-sol, cursor-fast, local-qwen -> account, model, cmd, cost
-  tasks/      task.json + CONTEXT.md (what the worker needs) + HANDOFF.md (what it left)
+  tasks/      task.json + CONTEXT.md + HANDOFF.md + optional immutable-input RECEIPT.json
   claims/     who holds which hand right now
   ledger.jsonl   usage per run: tokens, cost, seconds
   events.jsonl   the decklog: TASK CLAIM START END BLOCKED FAILED AUTH ... -> tail it to wake
@@ -27,7 +27,7 @@ Read [SPEC.md](SPEC.md) for the protocol (two pages). Everything below is the re
 One file, Python 3.8+, nothing else.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tyejcoleman/agent-deck/v0.4.0/install.sh | DECK_VERSION=v0.4.0 sh
+curl -fsSL https://raw.githubusercontent.com/tyejcoleman/agent-deck/v0.4.1/install.sh | DECK_VERSION=v0.4.1 sh
 deck --version
 ```
 
@@ -56,17 +56,39 @@ deck hand add claude-fable --account claude-work --model claude-fable-5-1 --cost
 deck hand add codex-sol    --account codex-team  --model gpt-5.6-sol      --cost mid
 deck hand add local-qwen   --account ollama      --model qwen3-coder:30b
 
-deck status                       # the roster: free / claimed / exhausted / needs-login, headroom
+deck status                       # roster + explicit usage left: free / claimed / exhausted / needs-login
 deck task add "Add retry to fetcher" --cost mid --needs refactor   # then edit .deck/tasks/<id>/CONTEXT.md
-deck run <task-id>                # route -> claim -> run the hand -> ledger -> HANDOFF.md -> END|BLOCKED
+deck run <task-id>                # route -> claim -> run the hand -> ledger -> HANDOFF.md -> END|BLOCKED|STALE
 deck run <id> --model claude-sonnet-5 --effort low   # on-the-fly model/effort for this run
 deck run t1 t2 t3 --bg && deck wait t1 t2 t3        # one free hand each, in parallel, detached
-deck events -f --type END,BLOCKED,AUTH   # wake on it, read the handoff, steer the next task
+deck events -f --type END,BLOCKED,STALE,AUTH   # wake on it, read the handoff, steer the next task
 deck models                       # catalog for YOUR providers: availability, good_for, efforts
 deck ledger --since 24h           # tokens / API cost / time per account + subscription $/mo
 ```
 
 `deck <command> --json` gives machine output. `deck run --dry` prints exactly what would run.
+
+For a review whose result must remain tied to one candidate, seal the task after its context and artifacts
+are ready:
+
+```bash
+deck task add "Review release candidate" --id rc-review --cwd ~/src/product
+# finish .deck/tasks/rc-review/CONTEXT.md first
+deck task seal rc-review --revision HEAD --artifact dist/SHA256SUMS.txt
+deck run rc-review
+deck task show rc-review            # input: current, plus the exact receipt
+```
+
+Sealing is opt-in so ordinary tasks remain lightweight. A sealed run binds the clean Git commit/tree,
+`CONTEXT.md`, and each named artifact by SHA-256. Deck checks them before claiming a hand, checks again
+immediately after claiming and before START, checks again after the worker exits and synchronous release
+hooks, and rechecks whenever
+status is read. Drift before START refuses the run without worker execution or usage;
+drift during or after a successful review changes the visible result to `STALE`, never `END`. A current
+run writes `RECEIPT.json`, which binds the handoff and worker log by SHA-256; later output edits also
+surface as `STALE`. The same input digest appears in `$DECK_INPUT_DIGEST`, START/terminal events, and the
+ledger. A sealed task has one result and cannot be reset or rerun; the refusal prints exact commands for
+a replacement. An `UNBOUND` result may still be useful work, but it is not release-readiness evidence.
 
 ## Accounts: connect everything once
 
@@ -116,7 +138,7 @@ to Claude `--effort`, Codex `-c model_reasoning_effort`, Cursor `model[effort=�
 Free hands are your parallelism budget. `deck route` lists them; `deck run t1 t2 t3 --bg` detaches one
 run per task, each claiming its own hand; `deck wait t1 t2 t3` (or `deck events -f`) collects results.
 A runner that dies is reaped to `failed` by the next `status`, so nothing stays stuck. Whether to go wide
-or sequential is the meta-agent's call, made from headroom: `deck status` shows `% of window` for
+or sequential is the meta-agent's call, made from headroom: `deck status` shows `% left of window` for
 subscriptions, `$ in window` for API accounts, tokens for local models.
 
 ## What the dollars mean (and when they don't)
@@ -142,7 +164,7 @@ the rules again (Anthropic un-pauses the credit), the same account switches to `
   statusline, so every render feeds the `rate_limits` payload (5h / 7-day `used_percentage` + exact
   `resets_at`) into the deck and shows a remaining-first HUD line (`deck · 5h 94% left ↻05:00 · 1w 92% left`).
   Your existing statusline is chained, not replaced. Claude Code's own cached utilization is read as a
-  second source. Result: `deck status` says `6% of 5h (tap)` — the same number Claude shows you — and
+  second source. Result: `deck status` says `94% left of 5h (tap)` when the vendor reports 6% used, and
   `deck account sync` tells you exactly when each window resets.
 - Between renders the deck estimates drift from the login's session logs (`<home>/projects/*.jsonl`, every
   session, deduplicated) using a learned tokens-per-percent, and marks it `≈`. It never fabricates: no
@@ -161,15 +183,16 @@ the rules again (Anthropic un-pauses the credit), the same account switches to `
 
 ## How the loop works
 
-1. **Meta-agent** writes a task + `CONTEXT.md` (or asks a worker to).
-2. `deck run` picks a hand by policy: free, account has headroom, closest cost class, most headroom left,
+1. **Meta-agent** writes a task + `CONTEXT.md` (or asks a worker to). For evidence-sensitive work, it
+   seals the finished context to a clean revision and required artifacts.
+2. `deck run` validates sealed inputs, then picks a hand by policy: free, account has headroom, closest cost class, most headroom left,
    least recently used. It claims the hand (exclusive file, so two meta-agents can share a deck).
 3. The hand's `cmd` runs in the task's `cwd` with the prompt + context. The worker is told to write
    `HANDOFF.md` (`## Status` END|BLOCKED, `## What changed`, `## Open questions`, `## Next step`) and
    gets `$DECK_CONTEXT`, `$DECK_HANDOFF`, `$DECK_TASK` in its environment.
-4. `deck run` records a ledger row (tokens parsed from vendor JSON where available), releases the claim,
+4. `deck run` revalidates sealed inputs, writes their receipt, records a ledger row (tokens parsed from vendor JSON where available), releases the claim,
    sets the task status, and emits `END`, `BLOCKED` (rate-limit text detected → account cooldown), or
-   `FAILED`. If the worker didn't write a handoff, a stub with the output tail is written so there is
+   `FAILED`, or `STALE`. If the worker didn't write a handoff, a stub with the output tail is written so there is
    always something to read.
 5. `hooks.d/END-*` / `hooks.d/BLOCKED-*` fire (ping Cos, post to Slack, whatever), and
    `deck events -f` wakes anything tailing the log.
@@ -205,7 +228,7 @@ Ephemeral hosts (CI, cloud-agent sandboxes) can't hold logins across runs; give 
 { "mcpServers": { "deck": { "command": "deck", "args": ["mcp"], "env": { "DECK_ROOT": "/Users/you/ops/.deck" } } } }
 ```
 
-  Tools: `deck_status`, `deck_route`, `deck_task_add`, `deck_task_ls`, `deck_task_show`, `deck_run`,
+  Tools: `deck_status`, `deck_route`, `deck_task_add`, `deck_task_seal`, `deck_task_ls`, `deck_task_show`, `deck_run`,
   `deck_wait`, `deck_handoff`, `deck_events`, `deck_ledger`, `deck_models`, `deck_models_refresh`, `deck_account_add`,
   `deck_account_ls`, `deck_account_check`, `deck_account_cooldown`, `deck_hand_add`, `deck_usage_add`. Each is a 1:1
   mirror of a CLI command. There is deliberately no login tool: credentials never pass through an agent.
@@ -234,7 +257,8 @@ still carries `units` and `seconds`; add tokens by hand with `deck usage add`.
 bash tests/smoke.sh      # end-to-end with fake hands; no vendor CLIs or credentials needed
 ```
 
-Covers routing, claims under contention, END/BLOCKED/FAILED, rate-limit cooldown, timeouts, oversize
+Covers routing, claims under contention, END/BLOCKED/FAILED/STALE, sealed revision/artifact/context
+preflight and postflight checks, receipts and read-time drift, rate-limit cooldown, timeouts, oversize
 prompts, bad cwd, hooks, torn log lines, corrupt records, token-metric and multi-window headroom, oauth
 and API-key login round trips with secrets kept out of `.deck/`, worker auth-failure detection, rejected
 keys, local-server health, and an MCP round trip. Passes on Python 3.8 and 3.12.

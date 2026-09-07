@@ -20,6 +20,7 @@ saves keystrokes · anything not read weekly gets cut.
   tasks/<id>/task.json      TASK     what to do, status, which hand, run count
   tasks/<id>/CONTEXT.md     CONTEXT  what the worker needs to start (markdown)
   tasks/<id>/HANDOFF.md     HANDOFF  what the worker left for the meta-agent (markdown)
+  tasks/<id>/RECEIPT.json   RECEIPT  exact sealed input verified before/after a review run
   tasks/<id>/runs/<n>.log   raw worker output per run
   claims/<hand>.json        CLAIM    lease on a hand: who, which task, until when
   ledger.jsonl              LEDGER   one row per run: units, tokens, seconds, cost
@@ -65,7 +66,7 @@ token** (the same posture as [tokenroom](https://github.com/tyejcoleman/tokenroo
    keyed by login dir and echoes as a remaining-first HUD line (an existing statusline is chained, not
    replaced). Claude Code's own `cachedUsageUtilization` in `<home>/.claude.json` is the second reading;
    the fresher wins. These windows are authoritative (`metric: "%"`, limit 100) and show as
-   `6% of 5h (tap)`, with the reading's age once it is over two minutes old.
+   `94% left of 5h (tap)` when 6% is used, with the reading's age once it is over two minutes old.
 2. **The login's own session logs** (`<home>/projects/*.jsonl`, one record per turn): tokens and requests per
    window across every session, deduplicated by request id. Used for the token detail, and to estimate drift
    between readings: when a fresher reading lands, `tokens_per_pct` is learned from the tokens spent between
@@ -97,11 +98,44 @@ run flag → task field → hand default. Templates pass `--add-dir {taskdir}` s
 HANDOFF.md outside the repo. If `{prompt}` is absent, or the prompt exceeds 100KB (Linux caps one argv
 string at 128KB), the prompt is piped to stdin. Reusable presets, not a registry: delete any hand nobody uses.
 
-**TASK** — `{"id", "title", "status": "open|running|done|blocked|failed", "cost", "needs": [...], "model",
-"effort", "cwd", "hand", "runs", "pid", "created"}`. `cost`/`needs`/`model` are routing preferences
+**TASK** — `{"id", "title", "status": "open|running|done|blocked|failed|stale", "cost", "needs": [...], "model",
+"effort", "cwd", "hand", "runs", "pid", "created", "input"}`. `cost`/`needs`/`model` are routing preferences
 (`needs` are matched against catalog `good_for` tags). `cwd` is where the worker runs (default: the
 directory containing `.deck/`). `pid` is set while a run is live; a task whose runner died is reaped to
-`failed` by the next `status`/`route`/`run`.
+`failed` by the next `status`/`route`/`run`. An absent `input` is explicitly `unbound`: backward-compatible
+work, but not immutable review evidence.
+
+`deck task seal <id> --revision <ref> [--artifact <file> ...]` adds the immutable **INPUT** manifest after
+`CONTEXT.md` is final and before the first run. With no arguments it defaults to `HEAD`; artifact-only
+binding is also allowed. A revision seal resolves and records the Git repository, exact commit and tree,
+and requires the checkout to be at that commit with no tracked or untracked changes. The manifest always
+records the task cwd and `CONTEXT.md` SHA-256, records each artifact's absolute path and SHA-256, and signs
+the canonical manifest with its own SHA-256 digest. A sealed task cannot be resealed, even before a run;
+cannot be changed through `task set`; and has exactly one result. Create a new task so evidence identity
+and its receipt are never rewritten. Deck prints the exact replacement-task and reseal commands.
+
+Deck derives the input state whenever a task is shown, listed, summarized, dispatched, waited on, or read
+through MCP:
+
+- `current` — manifest digest, cwd, context, revision/tree/clean checkout, artifacts, and any receipted
+  handoff/run log still match;
+- `stale` — any of those checks differs or is unavailable; a formerly `done` task is surfaced as `stale`;
+- `unbound` — no input manifest exists.
+
+Dispatch rejects `stale` before claim, then rechecks after the synchronous CLAIM hook and immediately
+before START; drift there releases the claim without worker execution or ledger activity. A bound run
+exports `DECK_INPUT_DIGEST`, records it in START, the ledger, and the terminal event, then verifies again
+after execution and synchronous RELEASE hooks before it may emit
+END. If an otherwise successful run drifted, it emits STALE and returns the same attention exit class as
+BLOCKED. This is fail-closed review validity, not source checkout locking; the worker may intentionally
+change its inputs, but that run cannot certify them.
+
+**RECEIPT** — `{"task", "run", "hand", "status", "input_digest", "verified_before", "verified_after",
+"input_state", "revision", "tree", "artifacts", "issues", "handoff_path", "handoff_sha256",
+"run_log_path", "run_log_sha256"}`. It is written for a bound run or manual
+handoff after post-validation. It proves what was checked and when; it does not claim that unbound work is
+validated. A manual handoff omits the run-log fields. Later input, handoff, or log drift leaves the
+historical receipt intact while the task surface becomes stale.
 
 **CATALOG** (`models.json`) — `{"updated", "synced", "models": {"<id>": {"vendor", "available",
 "seen", "good_for": [...], "efforts": [...], "cost", "context", "notes"}}}`. Scoped to the vendors you
@@ -121,12 +155,12 @@ not free. Claims are created exclusively (`O_EXCL`), so two meta-agents can shar
 Expired claims are ignored and overwritten.
 
 **LEDGER row** — `{"ts", "account", "hand", "task", "run", "units": 1, "tokens_in", "tokens_out",
-"cost_usd", "seconds", "exit"}`. `deck run` appends one per run and best-effort parses tokens from
+"cost_usd", "seconds", "exit", "input_state", "input_digest"}`. `deck run` appends one per run and best-effort parses tokens from
 vendor JSON output (`"input_tokens"`, `"output_tokens"`, `"total_cost_usd"`). Anything else records
 usage with `deck usage add`.
 
-**EVENT** — `{"ts", "type", "task", "hand", "by", "msg", ...}`. Types: `TASK` `CLAIM` `RELEASE`
-`START` `END` `BLOCKED` `FAILED` `COOLDOWN` `AUTH` `MODEL` `ACCOUNT` `HAND` `NOTE`. `AUTH` fires when an
+**EVENT** — `{"ts", "type", "task", "hand", "by", "msg", ...}`. Types: `TASK` `SEAL` `CLAIM` `RELEASE`
+`START` `END` `BLOCKED` `FAILED` `STALE` `COOLDOWN` `AUTH` `MODEL` `ACCOUNT` `HAND` `NOTE`. `AUTH` fires when an
 account's usability flips (`ok: true|false`) and carries the exact fix (`run: deck account login <id>`);
 it is the event a meta-agent forwards to the human. `MODEL` fires when a probe or a run learns a model
 id is (un)available. Free to extend; keep them uppercase and short.
@@ -134,9 +168,9 @@ id is (un)available. Free to extend; keep them uppercase and short.
 ## 3. Lifecycle
 
 ```
-meta: deck task add "…"  →  edit tasks/<id>/CONTEXT.md
-meta: deck run <task>    →  route → claim hand → run hand.cmd in task.cwd → parse usage → ledger
-                             → read HANDOFF.md → release → task.status → emit END | BLOCKED | FAILED
+meta: deck task add "…"  →  edit tasks/<id>/CONTEXT.md → optionally seal revision/artifacts
+meta: deck run <task>    →  verify input → route → claim → run hand.cmd → verify input → receipt + ledger
+                             → read HANDOFF.md → release → task.status → emit END | BLOCKED | FAILED | STALE
 meta: wake on the event  →  read HANDOFF.md → steer: new task, re-run, or stop
 ```
 
@@ -145,11 +179,13 @@ run per task, each claiming its own hand; `deck wait t1 t2 t3` (or the events) c
 work is just `deck run` without `--bg`. There is no scheduler — the meta-agent decides how many to
 dispatch by reading headroom, and the claim files make that decision safe across several meta-agents.
 
-The worker is told (in its prompt and via `$DECK_CONTEXT`, `$DECK_HANDOFF`, `$DECK_TASK`) to write
+The worker is told (in its prompt and via `$DECK_CONTEXT`, `$DECK_HANDOFF`, `$DECK_TASK`, and, when bound,
+`$DECK_INPUT_DIGEST`) to write
 HANDOFF.md before exiting. If it doesn't, `deck run` writes a stub from the output tail so the
 meta-agent always has something to read. Exit `0` without a handoff is `END`; non-zero is `FAILED`;
 non-zero with rate-limit text in the output is `BLOCKED` and puts the account on cooldown. A worker
-that cannot start (bad `cwd`, missing binary, timeout) is `FAILED` too. In every case the claim is
+that cannot start (bad `cwd`, missing binary, timeout) is `FAILED` too. A successful bound run whose
+inputs drift is `STALE`. In every case the claim is
 released and the task leaves `running` — a run never leaves the deck half-updated.
 
 Workers driven by hand (interactive Claude Code, a human) close the loop with
