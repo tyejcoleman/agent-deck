@@ -186,6 +186,35 @@ HR=$(deck account ls --json | python3 -c 'import json,sys; a=[x for x in json.lo
 [ "$HR" = "tokens 1160 1 11160 logs" ] && pass "local session logs: dedup by requestId, per-window tokens/requests" || fail "local logs ($HR)"
 deck account add logsacct --metric runs 2>out.txt >/dev/null; grep -q "old metric" out.txt && pass "warns when metric changes under existing limits" || fail "metric warning"
 
+# ---- subscription utilization from official local surfaces: Claude Code's cache, then tokenroom state; drift estimate ----
+NOWMS=$(python3 -c 'import time; print(int(time.time()*1000)-600000)')
+python3 - "$LH" "$NOWMS" <<'EOF2'
+import json, sys, time
+home, ms = sys.argv[1], int(sys.argv[2])
+json.dump({"cachedUsageUtilization": {"fetchedAtMs": ms, "utilization": {"five_hour": {"utilization": 40, "resets_at": "2099-01-01T05:00:00.000000+00:00"}, "seven_day": {"utilization": 12, "resets_at": "2099-01-03T12:00:00.000000+00:00"}}}}, open(home + "/.claude.json", "w"))
+EOF2
+deck account add logsacct --metric tokens --limit 0 >/dev/null
+[ "$(deck account ls --json | python3 -c 'import json,sys; a=[x for x in json.load(sys.stdin) if x["id"]=="logsacct"][0]; h=a["headroom"]; print(h["window"], h["used"], h["source"], a["remote"]["source"])')" = "5h 40.0 claude-cache claude-cache" ] && pass "claude-cache utilization governs (tightest window)" || fail "claude-cache: $(deck account ls --json | python3 -c 'import json,sys; a=[x for x in json.load(sys.stdin) if x["id"]=="logsacct"][0]; print(a.get("remote"), a["headroom"]["window"], a["headroom"]["used"], a["headroom"].get("source"))')"
+# the deck's own statusline tap: record -> read -> learn tokens-per-percent across two readings -> chain -> off
+export DECK_USAGE_DIR="$TMP/usage"
+PAY='{"rate_limits":{"five_hour":{"used_percentage":50,"resets_at":4102444800},"seven_day":{"used_percentage":12,"resets_at":4102531200}},"context_window":{"used_percentage":18},"model":{"id":"m"},"cost":{"total_cost_usd":0.01}}'
+HUD=$(echo "$PAY" | CLAUDE_CONFIG_DIR="$LH" deck tap)
+[ "$HUD" = "deck · 5h 50% left ↻00:00 · 1w 88% left ↻00:00 · ctx 82% left" ] && pass "tap prints remaining-first HUD" || fail "tap HUD ($HUD)"
+echo garbage | CLAUDE_CONFIG_DIR="$LH" deck tap >/dev/null && pass "tap never fails on junk" || fail "tap junk"
+deck account sync logsacct >/dev/null
+[ "$(deck account ls --json | python3 -c 'import json,sys; a=[x for x in json.load(sys.stdin) if x["id"]=="logsacct"][0]; h=a["headroom"]; print(h["source"], h["window"], h["used"])')" = "tap 5h 50.0" ] && pass "tap reading wins over the older claude-cache" || fail "tap read"
+sleep 1
+cat >> "$LH/projects/-tmp-x/s1.jsonl" <<EOF2
+{"type":"assistant","timestamp":"$(date -u +%Y-%m-%dT%H:%M:%S.500Z)","requestId":"r2","message":{"id":"m2","model":"x","usage":{"input_tokens":2000,"output_tokens":0}}}
+EOF2
+sleep 1; echo "${PAY/\"used_percentage\":50/\"used_percentage\":52}" | CLAUDE_CONFIG_DIR="$LH" deck tap >/dev/null
+deck account sync logsacct >/dev/null
+[ "$(deck account ls --json | python3 -c 'import json,sys; a=[x for x in json.load(sys.stdin) if x["id"]=="logsacct"][0]; print(a.get("tokens_per_pct"), a["headroom"]["used"])')" = "1000 52.0" ] && pass "learns tokens-per-percent from two readings + logs" || fail "tpp learn ($(deck account ls --json | python3 -c 'import json,sys; a=[x for x in json.load(sys.stdin) if x["id"]=="logsacct"][0]; print(a.get("tokens_per_pct"), a.get("remote"))'))"
+[ "$(echo "$PAY" | CLAUDE_CONFIG_DIR="$LH" deck tap --chain 'cat >/dev/null; echo other-hud')" = "other-hud" ] && pass "tap --chain keeps an existing statusline" || fail "tap chain"
+printf '{"statusLine":{"type":"command","command":"echo mine"}}\n' > "$LH/settings.json"
+deck account tap logsacct >/dev/null && grep -q -- "--chain 'echo mine'" "$LH/settings.json" && deck account tap logsacct --off >/dev/null && [ "$(python3 -c 'import json; print(json.load(open("'"$LH"'/settings.json"))["statusLine"]["command"])')" = "echo mine" ] && pass "account tap wires/chains/restores settings.json" || fail "account tap wiring"
+unset DECK_USAGE_DIR
+
 deck event NOTE --msg hi >/dev/null
 [ "$(deck events --type NOTE -n 1 --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["msg"])')" = hi ] && pass "events filter" || fail "events filter"
 

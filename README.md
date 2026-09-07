@@ -40,7 +40,8 @@ with git, SSH, or Syncthing and every machine sees the same roster.
 cd ~/ops && deck init
 
 # accounts = every login you own. The record is a pointer; tokens stay with the vendor CLI / OS keychain.
-deck account add claude-work --vendor claude --limit 200/5h --limit 1000/1w --monthly-usd 200 --now
+deck account add claude-work --vendor claude --monthly-usd 200 --now
+deck account tap claude-work                 # live 5h / 7-day % from Claude Code's own statusline payload
 deck account add codex-team  --vendor codex  --limit 50/5h --now
 deck account add anthropic   --vendor claude --auth apikey --price 3/15 --now     # hidden key prompt
 deck account add ollama      --vendor ollama                                       # local, free
@@ -115,15 +116,19 @@ subscriptions, `$ in window` for API accounts, tokens for local models.
 
 ## Costs and headroom
 
-- Subscription usage is **read from the vendor CLI's own session logs** where they exist (Claude Code:
-  `<home>/projects/*.jsonl`, one record per turn) — so headroom counts every session on that login,
-  interactive or headless, deduplicated by request id. Validated against a live Max login: 55 requests /
-  1.38M tokens in 5h, matching an independent recount exactly. Vendors without local logs (Cursor) fall
-  back to the deck's ledger; a `--usage-cmd` can supply numbers for anything else.
-- Quotas: `--limit 2000000/5h --limit 10000000/1w` (repeatable; tightest governs) once you know them.
-  Vendors publish subscription quotas loosely, so give the account `--plan max-20x` and the weekly research
-  task fills the limits in from published/observed numbers. Until then `deck status` shows absolute usage
-  ("1.4M tok in 5h (all sessions)") instead of a misleading percentage.
+- **Subscription headroom is the vendor's own number, read from official surfaces — never the network,
+  never a token.** For Claude Code, run `deck account tap <id>` once: it wires `deck tap` as that login's
+  statusline, so every render feeds the `rate_limits` payload (5h / 7-day `used_percentage` + exact
+  `resets_at`) into the deck and shows a remaining-first HUD line (`deck · 5h 94% left ↻05:00 · 1w 92% left`).
+  Your existing statusline is chained, not replaced. Claude Code's own cached utilization is read as a
+  second source. Result: `deck status` says `6% of 5h (tap)` — the same number Claude shows you — and
+  `deck account sync` tells you exactly when each window resets.
+- Between renders the deck estimates drift from the login's session logs (`<home>/projects/*.jsonl`, every
+  session, deduplicated) using a learned tokens-per-percent, and marks it `≈`. It never fabricates: no
+  reading, no percentage.
+- Vendors without a utilization surface (Cursor today) fall back to the deck's ledger with your own
+  `--limit N/WINDOW`; `--usage-cmd` can feed any other number. Rate-limit hits cool the account down until the
+  vendor's exact reset time.
 - API accounts: `--price IN/OUT` in USD per 1M tokens (on the account or the hand) turns parsed tokens
   into `cost_usd`; Claude's own `total_cost_usd` is used when present.
 - `--monthly-usd` on subscriptions shows up as a footer in `deck ledger`, so API spend and fixed

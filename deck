@@ -26,11 +26,13 @@ VERSION = "0.3.0"
 COSTS = ("free", "low", "mid", "high")
 HOMES = "~/.config/deck/homes"      # one vendor login dir per account; tokens live there (or the OS keychain), never in .deck/
 SECRETS = "~/.config/deck/secrets"  # 0600 files, used only when no keychain/libsecret is available
+USAGE = os.environ.get("DECK_USAGE_DIR", "~/.config/deck/usage")  # readings from `deck tap`, one file per login dir
 # Vendor table. Auth modes an account can use: oauth (the vendor CLI owns the login; `home` env isolates one
 # login per account), apikey (deck keeps the key in the OS keychain and injects `key` into the worker env),
 # none (local servers; `base_url` + `health`). cmd/flag/cost seed hands; edit hands/<id>.json freely.
 VENDORS = {
     "claude": dict(home="CLAUDE_CONFIG_DIR", default_home="~/.claude", usage_logs="projects", key="ANTHROPIC_API_KEY", login="claude auth login", status="claude auth status",
+                   usage_cache=".claude.json",
                    models_url="https://api.anthropic.com/v1/models", models_hdr={"x-api-key": "{key}", "anthropic-version": "2023-06-01"},
                    logout="claude auth logout", cmd="claude -p --add-dir {taskdir} --permission-mode acceptEdits --allowedTools Bash --output-format json{model} {prompt}",
                    flag="--model", effort=" --effort {effort}", efforts="low medium high xhigh max", cost="high"),
@@ -86,8 +88,8 @@ Remove stale entries: deck models rm <model-id>
 - Existing notes: run `deck models` first and only change what is wrong or missing.
 
 ## Subscription limits (if any account lists a `plan`)
-`deck account ls --json` shows accounts; for each oauth account with a `plan`, find the vendor's published or widely
-observed usage windows for that plan and set them in tokens: deck account add <id> --metric tokens --limit <tokens>/5h --limit <tokens>/1w
+`deck account ls --json` shows accounts; for each oauth account with a `plan` whose headroom is NOT already marked
+"(vendor)" (those read the vendor's own utilization), find the plan's published or widely observed usage windows and set them in tokens: deck account add <id> --metric tokens --limit <tokens>/5h --limit <tokens>/1w
 Say in notes how confident you are; vendors publish these loosely.
 
 ## Done when
@@ -127,6 +129,8 @@ ACCOUNTS (agents set them up; only humans log in):
   If you drive the terminal (tmux): run it with --headless yourself, relay the URL/code to the human, paste
   back the code they give you. Meanwhile: deck events -f --type AUTH   (wakes you when it flips to ok)
   Machine already logged in to the vendor? deck account add <id> --home default reuses that login.
+  Subscription headroom (Claude): deck account tap <id> once; then deck status shows "% of 5h/1w (tap)" and
+  deck account sync <id> shows the reset times = when it can be used again. Estimates are marked ≈.
   Never ask for a key in chat. Never read ~/.config/deck. Tokens stay in the vendor's dir or the OS keychain.
 
 WORKER (Claude Code, Codex, Cursor, Gemini) started by `deck run`:
@@ -552,6 +556,76 @@ def local_usage(acct, horizon):
     return rows
 
 
+def _epoch_iso(v):
+    try:
+        v = float(v)
+        return iso(dt.datetime.fromtimestamp(v / 1000 if v > 1e12 else v, dt.timezone.utc))
+    except (TypeError, ValueError):
+        return None
+
+
+def usage_key(home):
+    return hashlib.sha1(os.path.realpath(os.path.expanduser(home)).encode()).hexdigest()[:12]
+
+
+def acct_home(acct):
+    v = VENDORS.get(acct.get("vendor"), {})
+    return acct_env(acct).get(v.get("home") or "") or os.path.expanduser(v.get("default_home", "~"))
+
+
+def tap_windows(acct):
+    """The latest reading the deck's own statusline tap recorded for this login (see cmd_tap). Local file, no network."""
+    if acct.get("auth") != "oauth" or not VENDORS.get(acct.get("vendor"), {}).get("usage_cache"):
+        return None
+    f = Path(USAGE).expanduser() / (usage_key(acct_home(acct)) + ".json")
+    try:
+        r = json.loads(f.read_text(encoding="utf-8"))
+        return r if r.get("windows") and r.get("at") else None
+    except (OSError, ValueError):
+        return None
+
+
+def claude_cache_windows(acct):
+    """Claude Code's own cached utilization in <home>/.claude.json (written by the official client; local file)."""
+    v = VENDORS.get(acct.get("vendor"), {})
+    if acct.get("auth") != "oauth" or not v.get("usage_cache"):
+        return None
+    try:
+        c = json.loads((Path(acct_home(acct)) / v["usage_cache"]).read_text(encoding="utf-8")).get("cachedUsageUtilization") or {}
+    except (OSError, ValueError):
+        return None
+    u = c.get("utilization") or {}
+    wins = {w: {"percent": float(x["utilization"]), "reset_at": (x.get("resets_at") or "")[:19] + "Z" if x.get("resets_at") else None}
+            for k, w in (("five_hour", "5h"), ("seven_day", "1w")) for x in [u.get(k)] if isinstance(x, dict) and x.get("utilization") is not None}
+    return {"windows": wins, "at": _epoch_iso(c.get("fetchedAtMs")), "source": "claude-cache"} if wins and c.get("fetchedAtMs") else None
+
+
+def vendor_usage(deck, acct):
+    """Freshest official-surface reading of the vendor's own utilization numbers. Never the network, never a token."""
+    cands = [r for r in (tap_windows(acct), claude_cache_windows(acct)) if r and r.get("at")]
+    return max(cands, key=lambda r: r["at"]) if cands else None
+
+
+def refresh_remote(deck, acct, max_age=60):
+    """Re-read the local utilization sources at most once a minute; learn tokens-per-percent when a fresher reading lands."""
+    rem = acct.get("remote") or {}
+    if rem.get("checked") and (now() - ts(rem["checked"])).total_seconds() < max_age:
+        return
+    r = vendor_usage(deck, acct)
+    if r is None:
+        return
+    if rem.get("at") and r["at"] > rem["at"] and rem.get("windows", {}).get("5h") and r["windows"].get("5h"):
+        d_pct = r["windows"]["5h"]["percent"] - rem["windows"]["5h"]["percent"]
+        logs = local_usage(acct, dur("5h")) or []
+        toks = sum(a + b for t, a, b in logs if rem["at"] < t[:19] + "Z" <= r["at"])
+        if d_pct > 0 and toks > 0:
+            acct["tokens_per_pct"] = round(toks / d_pct)
+    if r.get("tokens_per_pct"):
+        acct["tokens_per_pct"] = r["tokens_per_pct"]
+    acct["remote"] = dict(r, checked=iso(now()))
+    deck.save(acct, "accounts", acct["id"] + ".json")
+
+
 def headroom(acct, ledger):
     """Tightest of the account's rate windows (`limits: {"5h": 200, "1w": 1000}`), from the ledger plus an optional
     fresh `remote` reading (`deck account sync`). Subscription windows are estimates unless synced."""
@@ -573,12 +647,24 @@ def headroom(acct, ledger):
         wins.append(dict(sums, window=win, used=used, limit=limit, frac=max(0.0, 1 - used / limit) if limit else 1.0,
                          reset_at=iso(ts(first) + dt.timedelta(seconds=dur(win))) if first else None))
     rem = acct.get("remote") or {}
-    if rem.get("at") and (t - ts(rem["at"])).total_seconds() < 3600 and rem.get("limit"):
+    if rem.get("windows") and rem.get("at") and (t - ts(rem["at"])).total_seconds() < 7 * 86400:
+        detail, age = {w["window"]: w for w in wins}, (t - ts(rem["at"])).total_seconds()
+        since = sum(a + b for tt, a, b in (logs or []) if tt[:19] + "Z" > rem["at"])  # tokens this login spent after the reading
+        wins = []
+        for w, x in rem["windows"].items():
+            pct, est = x["percent"], False
+            if x.get("reset_at") and ts(x["reset_at"]) <= t:
+                pct, est = 0.0, False  # the window has reset since the reading
+            elif since and acct.get("tokens_per_pct"):
+                pct, est = min(100.0, pct + since / acct["tokens_per_pct"]), True
+            wins.append(dict(detail.get(w, {}), window=w, used=round(pct, 1), limit=100, metric="%", remote=True, est=est, source=rem.get("source"),
+                             reading_age=age, frac=max(0.0, 1 - pct / 100), reset_at=x.get("reset_at") or detail.get(w, {}).get("reset_at")))
+    elif rem.get("limit") and rem.get("at") and (t - ts(rem["at"])).total_seconds() < 3600:  # usage_cmd style {used, limit, window?, reset_at?}
         wins.append({"window": rem.get("window", "remote"), "used": rem["used"], "limit": rem["limit"], "remote": True,
                      "frac": max(0.0, 1 - rem["used"] / rem["limit"]), "reset_at": rem.get("reset_at")})
     tight, cool = min(wins, key=lambda w: (w["frac"], dur(w["window"]) if re.fullmatch(r"\d+[smhdw]", w["window"]) else 0)), acct.get("cooldown_until")
     state = "cooldown" if cool and ts(cool) > t else "exhausted" if tight["limit"] and tight["used"] >= tight["limit"] else "ok"
-    return dict(tight, account=acct["id"], metric=metric, windows=wins, state=state,
+    return dict(tight, account=acct["id"], metric=tight.get("metric", metric), windows=wins, state=state,
                 left=(tight["limit"] - tight["used"]) if tight["limit"] else None, cooldown_until=cool if state == "cooldown" else None)
 
 
@@ -609,6 +695,8 @@ def roster(deck):
     reap(deck)
     ledger, catalog = deck.rows("ledger.jsonl"), deck.models()
     accts = {a["id"]: a for a in deck.items("accounts")}
+    for a in accts.values():
+        refresh_remote(deck, a)
     hr = {aid: headroom(a, ledger) for aid, a in accts.items()}
     last = {r.get("hand"): r["ts"] for r in ledger}
     res = []
@@ -679,6 +767,75 @@ def finish(deck, task, status, by, **ev):
 
 
 # ---------- commands ----------
+def cmd_tap(a):
+    """Statusline command for Claude Code: record rate_limits for this login, print a remaining-first HUD line. Never fails."""
+    raw = sys.stdin.read()
+    try:
+        p = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        p = {}
+    home = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    wins = {}
+    for k, w in (("five_hour", "5h"), ("seven_day", "1w")):
+        x = (p.get("rate_limits") or {}).get(k) if isinstance(p.get("rate_limits"), dict) else None
+        if isinstance(x, dict) and isinstance(x.get("used_percentage"), (int, float)):
+            wins[w] = {"percent": max(0.0, min(100.0, float(x["used_percentage"]))), "reset_at": _epoch_iso(x.get("resets_at"))}
+    if wins:
+        try:
+            d = Path(USAGE).expanduser()
+            d.mkdir(parents=True, exist_ok=True)
+            rec = {"at": iso(now()), "source": "tap", "home": os.path.realpath(home), "windows": wins, "model": (p.get("model") or {}).get("id"),
+                   "context_pct": (p.get("context_window") or {}).get("used_percentage"), "session_cost_usd": (p.get("cost") or {}).get("total_cost_usd")}
+            tmp = d / ("%s.%d.tmp" % (usage_key(home), os.getpid()))
+            tmp.write_text(json.dumps(rec), encoding="utf-8")
+            os.replace(str(tmp), str(d / (usage_key(home) + ".json")))
+        except OSError:
+            pass
+    if a.chain:  # keep the user's existing statusline: same payload in, its output out
+        try:
+            r = subprocess.run(a.chain, shell=True, input=raw, capture_output=True, text=True, timeout=5)
+            sys.stdout.write(r.stdout)
+            return 0
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    parts = ["%s %d%% left" % (w, round(100 - x["percent"])) + (" ↻%s" % x["reset_at"][11:16] if x.get("reset_at") else "") for w, x in wins.items()]
+    ctx = (p.get("context_window") or {}).get("used_percentage")
+    if isinstance(ctx, (int, float)):
+        parts.append("ctx %d%% left" % round(100 - ctx))
+    print("deck · " + " · ".join(parts) if parts else "deck · (no rate_limits in payload)")
+    return 0
+
+
+def account_tap(deck, acct, a):
+    """Wire `deck tap` as the statusline of this login's Claude Code, chaining any existing statusline instead of replacing it."""
+    if acct.get("auth") != "oauth" or not VENDORS.get(acct.get("vendor"), {}).get("usage_cache"):
+        die("tap works for Claude Code logins (vendor claude, auth oauth)")
+    f = Path(acct_home(acct)) / "settings.json"
+    try:
+        settings = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+    except ValueError:
+        die("%s is not valid JSON" % f)
+    me = "%s tap" % shlex.quote(os.path.abspath(__file__))
+    cur = (settings.get("statusLine") or {}).get("command", "")
+    if a.off:
+        if me in cur:
+            bak = settings.pop("statusLine_deck_bak", None)
+            settings.pop("statusLine", None)
+            if bak:
+                settings["statusLine"] = bak
+        msg = "tap removed from %s" % f
+    elif me in cur:
+        msg = "tap already wired in %s" % f
+    else:
+        if cur:
+            settings["statusLine_deck_bak"] = settings["statusLine"]
+        settings["statusLine"] = {"type": "command", "command": me + (" --chain %s" % shlex.quote(cur) if cur else "")}
+        msg = "tap wired into %s%s\nopen one Claude Code session on this login; the HUD line confirms and `deck status` shows live %% of window" % (f, " (chained after your existing statusline)" if cur else "")
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    return out(a, settings.get("statusLine"), msg)
+
+
 def cmd_init(a):
     root = Path(a.path or ".").resolve() / ".deck"
     for d in ("accounts", "hands", "tasks", "claims", "hooks.d"):
@@ -747,6 +904,8 @@ def account_add(deck, a):
         probe = dict(rec, env={k: x for k, x in rec["env"].items() if k != v["home"]})  # the vendor's default dir
         if _default_login_exists(v, probe):
             hint += "\nnote: this machine already has a %s login in the default dir; to reuse it: deck account add %s --home default" % (rec["vendor"], a.id)
+    if ok and rec["auth"] == "oauth" and v.get("usage_cache") and not tap_windows(rec):
+        hint += "\nlive subscription usage: deck account tap %s   (statusline tap; official surface, no network)" % a.id
     out(a, rec, "account %s saved (%s, auth=%s, limits=%s): %s%s" % (a.id, rec["vendor"], rec["auth"], rec.get("limits") or "none", rec["check"]["msg"], hint))
 
 
@@ -791,6 +950,8 @@ def cmd_account(deck, a):
         return account_add(deck, a)
     if a.sub == "login":
         return account_login(deck, deck.load("accounts", a.id + ".json"), a)
+    if a.sub == "tap":
+        return account_tap(deck, deck.load("accounts", a.id + ".json"), a)
     if a.sub == "check":
         accts = [deck.load("accounts", a.id + ".json")] if a.id else deck.items("accounts")
         oks = [check_account(deck, x, quiet=a.json) for x in accts]
@@ -808,10 +969,12 @@ def cmd_account(deck, a):
         return out(a, acct, "logged out %s" % a.id)
     if a.sub == "sync":
         acct = deck.load("accounts", a.id + ".json")
-        if not acct.get("usage_cmd") and local_usage(acct, 3600) is not None:
+        if not acct.get("usage_cmd") and (vendor_usage(deck, acct) is not None or local_usage(acct, 3600) is not None):
+            refresh_remote(deck, acct, max_age=0)
             hr = headroom(acct, deck.rows("ledger.jsonl"))
-            return out(a, hr, "\n".join("%s: %s tok, %s requests (all sessions on this login)%s" % (w["window"], w.get("tokens"), w.get("requests"),
-                                                                                                   " - %d%% of limit" % round(100 * w["used"] / w["limit"]) if w.get("limit") else "") for w in hr["windows"]))
+            return out(a, hr, "\n".join("%s: %s%s%s" % (w["window"], "%s%d%% used (%s, read %s), resets %s" % ("≈" if w.get("est") else "", w["used"], w.get("source"), acct.get("remote", {}).get("at"), w.get("reset_at")) if w.get("metric") == "%" else "",
+                                                     " | %s tok, %s requests on this login" % (w.get("tokens"), w.get("requests")) if w.get("requests") is not None else "",
+                                                     " | %d%% of your limit" % round(100 * w["used"] / w["limit"]) if w.get("limit") and w.get("metric") != "%" else "") for w in hr["windows"]))
         cmd = acct.get("usage_cmd") or die("account %s has no usage_cmd (a command printing JSON {used, limit, window?, reset_at?})" % a.id)
         r = subprocess.run(cmd, shell=True, env=dict(os.environ, **acct_env(acct)), capture_output=True, text=True, timeout=120)
         rem = json.loads(r.stdout or "{}") if r.returncode == 0 else die("usage_cmd failed: %s" % (r.stderr or r.stdout).strip())
@@ -827,8 +990,10 @@ def cmd_account(deck, a):
         deck.save(rec, "accounts", a.id + ".json")
         emit(deck, "COOLDOWN", account=a.id, until=rec["cooldown_until"], by=who(a))
         return out(a, rec, "account %s cooldown until %s" % (a.id, rec["cooldown_until"]))
-    ledger = deck.rows("ledger.jsonl")
-    rows = [dict(x, headroom=headroom(x, ledger)) for x in deck.items("accounts")]
+    ledger, accts = deck.rows("ledger.jsonl"), deck.items("accounts")
+    for x in accts:
+        refresh_remote(deck, x)
+    rows = [dict(x, headroom=headroom(x, ledger)) for x in accts]
 
     out(a, rows, table(["ACCOUNT", "VENDOR", "AUTH", "STATE", "HEADROOM", "CHECKED", "$/MO", "LOGIN"],
                        [[r["id"], r.get("vendor", ""), r.get("auth", "?"), auth_state(r) or r["headroom"]["state"], head_text(r["headroom"], r),
@@ -842,8 +1007,12 @@ def head_text(hr, acct=None):
     auth, w = (acct or {}).get("auth", "none"), hr["window"]
     tok = "%.1fM tok" % (hr.get("tokens", 0) / 1e6) if hr.get("tokens", 0) >= 1e6 else "%dk tok" % (hr.get("tokens", 0) / 1e3)
     if hr.get("limit"):
-        core = "%d%% of %s" % (round(100 * hr["used"] / hr["limit"]), w) + (" (synced)" if hr.get("remote") else "")
-        return core + (" · $%.2f" % hr["usd"] if auth == "apikey" else "")
+        if hr.get("metric") == "%":
+            age = hr.get("reading_age") or 0
+            core = "%s%d%% of %s (%s%s)" % ("≈" if hr.get("est") else "", round(hr["used"]), w, hr.get("source", "vendor"), " %s ago" % fdur(age) if age > 120 else "")
+        else:
+            core = "%d%% of %s" % (round(100 * hr["used"] / hr["limit"]), w) + (" (synced)" if hr.get("remote") else "")
+        return core + (" · $%.2f" % hr["usd"] if auth == "apikey" else " · " + tok if hr.get("requests") is not None else "")
     if auth == "apikey":
         return "$%.2f in %s" % (hr.get("usd", 0), w)
     if hr.get("source") == "logs":
@@ -1088,7 +1257,11 @@ def cmd_run(deck, a):
         emit(deck, "AUTH", account=acct["id"], ok=False, by=by, msg=msg)
     elif re.search(RATE_LIMIT_RE, output):
         status, msg = "BLOCKED", "rate limited on account %s" % acct["id"]
-        acct["cooldown_until"] = iso(now() + dt.timedelta(seconds=dur(acct.get("cooldown") or ("5m" if acct.get("auth") == "apikey" else "1h"))))
+        m = re.search(r"limit reached\|(\d{10})", output)  # Claude Code appends the reset epoch to its limit message
+        resets = [w.get("reset_at") for w in (acct.get("remote") or {}).get("windows", {}).values() if w.get("reset_at")]
+        acct["cooldown_until"] = (_epoch_iso(m.group(1)) if m else min(r for r in resets if ts(r) > now()) if any(ts(r) > now() for r in resets)
+                                  else iso(now() + dt.timedelta(seconds=dur(acct.get("cooldown") or ("5m" if acct.get("auth") == "apikey" else "1h")))))
+        msg += "; usable again %s" % acct["cooldown_until"]
         deck.save(acct, "accounts", acct["id"] + ".json")
         emit(deck, "COOLDOWN", account=acct["id"], until=acct["cooldown_until"], by=by, msg=msg)
     else:
@@ -1415,6 +1588,8 @@ def build_parser():
     q.add_argument("id"), q.add_argument("--headless", action="store_true", help="no browser here: device code / paste-URL flow")
     q.add_argument("--from-env", help="apikey: read the key from this env var"), q.add_argument("--from-file", help="apikey: read the key from this file, then delete it")
     sp("check", cmd_account, "refresh auth/reachability state (never prints secrets)", s).add_argument("id", nargs="?")
+    q = sp("tap", cmd_account, "wire `deck tap` as this Claude login's statusline: live subscription %% of window, official surface, no network", s)
+    q.add_argument("id"), q.add_argument("--off", action="store_true", help="remove it (restores a chained statusline)")
     sp("ls", cmd_account, "list accounts with auth state and headroom", s)
     sp("logout", cmd_account, "drop the login / delete the stored key", s).add_argument("id")
     sp("sync", cmd_account, "run usage_cmd and store the vendor's own usage numbers", s).add_argument("id")
@@ -1485,6 +1660,8 @@ def build_parser():
     p = sp("event", cmd_event, "emit an event (e.g. NOTE)")
     p.add_argument("type"), p.add_argument("--task"), p.add_argument("--hand"), p.add_argument("--msg")
     sp("mcp", cmd_mcp, "serve the deck over MCP stdio")
+    p = sp("tap", cmd_tap, "statusline command (wired by `deck account tap`): records rate_limits, prints a HUD line")
+    p.add_argument("--chain", help="also run this statusline command with the same payload and print its output")
     return ap
 
 
@@ -1494,8 +1671,8 @@ def main(argv=None):
     if not getattr(a, "fn", None):
         getattr(a, "group", ap).print_help()
         return 1
-    if a.fn is cmd_init:
-        return cmd_init(a)
+    if a.fn in (cmd_init, cmd_tap):
+        return a.fn(a)
     return a.fn(Deck.find(), a)
 
 

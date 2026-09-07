@@ -56,15 +56,29 @@ A worker that reports an auth failure flips `check.ok` to false (for API keys, t
 fingerprint is remembered until a different key is stored). Hands on such an account show
 `needs-login` (or `down`) and are excluded from routing.
 
-Headroom = tightest of the `limits` windows, measured in the account's `metric` (`runs`, `tokens`, `usd`).
-Three sources, most truthful wins: (1) **the vendor CLI's own session logs** on that login — Claude Code
-writes one JSONL record per assistant turn under `<home>/projects/`; deck sums tokens and requests per
-window across *every* session on the login (interactive included), deduplicated by request id — this is the
-default metric (`tokens`) for such vendors; (2) the LEDGER (deck's own runs) for everything else; (3) an
-optional `remote` reading from `deck account sync` via `usage_cmd`. `plan` names the subscription tier so the
-weekly research task can fill `limits` with the vendor's published/observed quota; until then headroom shows
-absolute usage ("1.4M tok in 5h (all sessions)") rather than a percentage. `price` (USD per 1M tokens)
-computes `cost_usd` for runs whose vendor reports tokens but no cost. `monthly_usd` is informational.
+Headroom = the tightest window. Sources, in order of truth, **all local files, never the network, never a
+token** (the same posture as [tokenroom](https://github.com/tyejcoleman/tokenroom) ADR-1):
+
+1. **The vendor's own utilization numbers**, read from official surfaces. For Claude Code: `deck account tap
+   <id>` wires `deck tap` as that login's statusline command; every render hands it the `rate_limits` payload
+   (`five_hour`/`seven_day` `used_percentage`, `resets_at`), which it records under `~/.config/deck/usage/`
+   keyed by login dir and echoes as a remaining-first HUD line (an existing statusline is chained, not
+   replaced). Claude Code's own `cachedUsageUtilization` in `<home>/.claude.json` is the second reading;
+   the fresher wins. These windows are authoritative (`metric: "%"`, limit 100) and show as
+   `6% of 5h (tap)`, with the reading's age once it is over two minutes old.
+2. **The login's own session logs** (`<home>/projects/*.jsonl`, one record per turn): tokens and requests per
+   window across every session, deduplicated by request id. Used for the token detail, and to estimate drift
+   between readings: when a fresher reading lands, `tokens_per_pct` is learned from the tokens spent between
+   the two; until the next reading, usage is shown as `≈` from tokens spent since — never presented as fact.
+   A window whose `reset_at` has passed reads 0.
+3. **The LEDGER** (deck's own runs) for vendors with neither, in the account's `metric` (`runs`, `tokens`,
+   `usd`), against `limits`. `usage_cmd` + `deck account sync` can feed any other number.
+
+On a rate-limit response the account cools down until the vendor's exact reset time when known (the tap's
+`resets_at`, or the epoch Claude Code appends to its limit message), else a short default. `plan` is a
+label for the research task (vendors without utilization surfaces). `price` computes `cost_usd`;
+`monthly_usd` is informational. Observed on a Max account (2026-09-07): headless `claude -p` runs *did*
+move the 5h window (3% → 5% after a $0.31 run); the deck asserts neither way — it reads the numbers.
 
 **HAND** — `{"id", "vendor", "account", "model", "effort", "cost": "free|low|mid|high", "price", "cmd"}`.
 `cmd` is a shell string. Placeholders: `{prompt}` (shell-quoted), `{context}`, `{handoff}`, `{taskdir}`
