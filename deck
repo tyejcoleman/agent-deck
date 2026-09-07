@@ -30,7 +30,7 @@ SECRETS = "~/.config/deck/secrets"  # 0600 files, used only when no keychain/lib
 # login per account), apikey (deck keeps the key in the OS keychain and injects `key` into the worker env),
 # none (local servers; `base_url` + `health`). cmd/flag/cost seed hands; edit hands/<id>.json freely.
 VENDORS = {
-    "claude": dict(home="CLAUDE_CONFIG_DIR", key="ANTHROPIC_API_KEY", login="claude auth login", status="claude auth status",
+    "claude": dict(home="CLAUDE_CONFIG_DIR", default_home="~/.claude", usage_logs="projects", key="ANTHROPIC_API_KEY", login="claude auth login", status="claude auth status",
                    models_url="https://api.anthropic.com/v1/models", models_hdr={"x-api-key": "{key}", "anthropic-version": "2023-06-01"},
                    logout="claude auth logout", cmd="claude -p --add-dir {taskdir} --permission-mode acceptEdits --allowedTools Bash --output-format json{model} {prompt}",
                    flag="--model", effort=" --effort {effort}", efforts="low medium high xhigh max", cost="high"),
@@ -85,6 +85,11 @@ Remove stale entries: deck models rm <model-id>
 - Keep it to what matters for routing (roughly 5-12 entries). When unsure, say so in notes rather than guessing.
 - Existing notes: run `deck models` first and only change what is wrong or missing.
 
+## Subscription limits (if any account lists a `plan`)
+`deck account ls --json` shows accounts; for each oauth account with a `plan`, find the vendor's published or widely
+observed usage windows for that plan and set them in tokens: deck account add <id> --metric tokens --limit <tokens>/5h --limit <tokens>/1w
+Say in notes how confident you are; vendors publish these loosely.
+
 ## Done when
 `deck models` shows current entries, each with vendor and good_for. Write the handoff with what changed and any doubts.
 """
@@ -111,6 +116,7 @@ META-AGENT (Cos, OpenClaw, Grok bot, human):
   deck models                    catalog for your providers (AVAIL, good_for, efforts); stale -> deck models refresh --run
   deck events -f                 wake on END/BLOCKED/AUTH/MODEL, read HANDOFF.md, steer the next task
   Parallelism = free hands (deck route). Budget = headroom in deck status (% of window / $ / tokens).
+  Run concurrent tasks on DIFFERENT repos (or disjoint files): two hands editing one working tree race each other.
   deck <command> --json          machine output
 
 ACCOUNTS (agents set them up; only humans log in):
@@ -146,7 +152,7 @@ def iso(t):
 
 
 def ts(s):
-    return dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+    return dt.datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=dt.timezone.utc)
 
 
 def dur(s):
@@ -512,20 +518,60 @@ def emit(deck, type_, **kw):
     return ev
 
 
+def local_usage(acct, horizon):
+    """Ground truth for subscriptions: the vendor CLI's own session logs on this login (every session, interactive
+    included). Claude Code writes one JSONL record per assistant turn with message.usage. Returns [(ts, in, out)] or None."""
+    v = VENDORS.get(acct.get("vendor"), {})
+    if acct.get("auth") != "oauth" or not v.get("usage_logs"):
+        return None
+    home = acct_env(acct).get(v.get("home") or "") or os.path.expanduser(v.get("default_home", "~"))
+    root = Path(home) / v["usage_logs"]
+    if not root.is_dir():
+        return None
+    cutoff, rows, seen = time.time() - horizon, [], set()
+    for f in root.rglob("*.jsonl"):
+        if f.stat().st_mtime < cutoff:
+            continue
+        with open(str(f), encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"usage"' not in line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                m, t = o.get("message") or {}, o.get("timestamp")
+                u = m.get("usage") if isinstance(m, dict) else None
+                if not isinstance(u, dict) or not t:
+                    continue
+                key = o.get("requestId") or m.get("id") or o.get("uuid")
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append((t, sum(int(u.get(k) or 0) for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")), int(u.get("output_tokens") or 0)))
+    return rows
+
+
 def headroom(acct, ledger):
     """Tightest of the account's rate windows (`limits: {"5h": 200, "1w": 1000}`), from the ledger plus an optional
     fresh `remote` reading (`deck account sync`). Subscription windows are estimates unless synced."""
     t, metric = now(), acct.get("metric", "runs")
     limits = acct.get("limits") or ({acct["window"]: acct["limit"]} if acct.get("limit") else {acct.get("window", "5h"): None})
     mine = [r for r in ledger if r.get("account") == acct["id"]]
+    logs = local_usage(acct, max(dur(w) for w in limits))
     wins = []
     for win, limit in limits.items():
         rows = [r for r in mine if (t - ts(r["ts"])).total_seconds() < dur(win)]
         sums = {"runs": sum(r.get("units", 1) for r in rows), "tokens": sum((r.get("tokens_in") or 0) + (r.get("tokens_out") or 0) for r in rows),
                 "usd": round(sum(r.get("cost_usd") or 0 for r in rows), 4)}
+        first = min((r["ts"] for r in rows), default=None)
+        if logs is not None:  # every session on this login, not just deck runs
+            lrows = [r for r in logs if (t - ts(r[0])).total_seconds() < dur(win)]
+            sums.update(tokens=sum(a + b for _, a, b in lrows), requests=len(lrows), source="logs")
+            first = min([r[0] for r in lrows] + ([first] if first else []), default=None)
         used = sums.get(metric, sums["runs"])
         wins.append(dict(sums, window=win, used=used, limit=limit, frac=max(0.0, 1 - used / limit) if limit else 1.0,
-                         reset_at=iso(ts(min(r["ts"] for r in rows)) + dt.timedelta(seconds=dur(win))) if rows else None))
+                         reset_at=iso(ts(first) + dt.timedelta(seconds=dur(win))) if first else None))
     rem = acct.get("remote") or {}
     if rem.get("at") and (t - ts(rem["at"])).total_seconds() < 3600 and rem.get("limit"):
         wins.append({"window": rem.get("window", "remote"), "used": rem["used"], "limit": rem["limit"], "remote": True,
@@ -657,11 +703,14 @@ def parse_price(s):  # "3/15" -> USD per million tokens in/out
 def account_add(deck, a):
     f = deck.p("accounts", a.id + ".json")
     rec = dict(deck.parse(f) if f.exists() else {}, id=a.id)
-    for k in ("vendor", "login", "metric", "notes", "base_url", "usage_cmd", "status_cmd", "login_cmd", "monthly_usd"):
+    for k in ("vendor", "login", "metric", "notes", "base_url", "usage_cmd", "status_cmd", "login_cmd", "monthly_usd", "plan"):
         if getattr(a, k) is not None:
             rec[k] = getattr(a, k)
-    rec.setdefault("vendor", "custom"), rec.setdefault("metric", "runs")
+    rec.setdefault("vendor", "custom")
     v = VENDORS.get(rec["vendor"], {})
+    rec.setdefault("metric", "tokens" if v.get("usage_logs") else "runs")  # subscriptions with local logs count real tokens
+    if a.metric and rec.get("limits") and a.limit is None:
+        print("deck: metric is now %s but limits %s were set under the old metric; reset them with --limit N/WINDOW (0 clears)" % (a.metric, rec["limits"]), file=sys.stderr)
     if a.limit is not None:
         limits = {}
         for spec in a.limit:
@@ -759,6 +808,10 @@ def cmd_account(deck, a):
         return out(a, acct, "logged out %s" % a.id)
     if a.sub == "sync":
         acct = deck.load("accounts", a.id + ".json")
+        if not acct.get("usage_cmd") and local_usage(acct, 3600) is not None:
+            hr = headroom(acct, deck.rows("ledger.jsonl"))
+            return out(a, hr, "\n".join("%s: %s tok, %s requests (all sessions on this login)%s" % (w["window"], w.get("tokens"), w.get("requests"),
+                                                                                                   " - %d%% of limit" % round(100 * w["used"] / w["limit"]) if w.get("limit") else "") for w in hr["windows"]))
         cmd = acct.get("usage_cmd") or die("account %s has no usage_cmd (a command printing JSON {used, limit, window?, reset_at?})" % a.id)
         r = subprocess.run(cmd, shell=True, env=dict(os.environ, **acct_env(acct)), capture_output=True, text=True, timeout=120)
         rem = json.loads(r.stdout or "{}") if r.returncode == 0 else die("usage_cmd failed: %s" % (r.stderr or r.stdout).strip())
@@ -791,7 +844,11 @@ def head_text(hr, acct=None):
     if hr.get("limit"):
         core = "%d%% of %s" % (round(100 * hr["used"] / hr["limit"]), w) + (" (synced)" if hr.get("remote") else "")
         return core + (" · $%.2f" % hr["usd"] if auth == "apikey" else "")
-    return ("$%.2f in %s" % (hr.get("usd", 0), w) if auth == "apikey" else tok + " in %s" % w if auth == "none" else "%s runs in %s" % (hr.get("runs", hr["used"]), w))
+    if auth == "apikey":
+        return "$%.2f in %s" % (hr.get("usd", 0), w)
+    if hr.get("source") == "logs":
+        return "%s in %s (all sessions)" % (tok, w)
+    return tok + " in %s" % w if auth == "none" else "%s runs in %s" % (hr.get("runs", hr["used"]), w)
 
 
 def cmd_hand(deck, a):
@@ -1348,6 +1405,7 @@ def build_parser():
     q.add_argument("--key-env", help="env var the CLI reads the API key from (custom vendors)"), q.add_argument("--base-url", help="local server URL")
     q.add_argument("--limit", action="append", help="N/WINDOW e.g. 200/5h, repeatable (N alone = per 5h; 0 clears)"), q.add_argument("--metric", choices=("runs", "tokens", "usd"), help="what limits count: runs (default), tokens, or usd (API budgets)")
     q.add_argument("--price", help="USD per 1M tokens IN/OUT, e.g. 3/15 (API accounts)"), q.add_argument("--monthly-usd", type=float, help="subscription price, informational")
+    q.add_argument("--plan", help="subscription plan name, e.g. max-20x; the research task fills in its limits")
     q.add_argument("--env", action="append", help="KEY=VAL applied when hands on this account run (repeatable)")
     q.add_argument("--login", help="who/where this is logged in (pointer, never a secret)"), q.add_argument("--usage-cmd", help="command printing JSON {used, limit, window?, reset_at?} for `deck account sync`")
     q.add_argument("--status-cmd", help="override the vendor's login-status command (exit 0 = logged in)"), q.add_argument("--login-cmd", help="override the vendor's login command"), q.add_argument("--notes")

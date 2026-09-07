@@ -69,7 +69,7 @@ An agent can set up every account (`deck account add`); only a human ever logs i
 | mode | who holds the credential | how you log in |
 |---|---|---|
 | `oauth` (Claude Code, Codex, Cursor, Gemini subscriptions) | the vendor CLI, in a per-account dir `~/.config/deck/homes/<id>` (0700) | `deck account login <id>` → browser. `--headless` on a VPS → device code / URL you finish on your phone |
-| `apikey` (Anthropic, OpenAI, Google, Cursor API; any custom `--key-env`) | OS keychain (macOS), `secret-tool` (Linux), else a 0600 file under `~/.config/deck/secrets/` | `deck account login <id>` → hidden prompt, or `--from-env VAR`, `--from-file F` (deleted after), or a pipe |
+| `apikey` (Anthropic, OpenAI, Google, Cursor API; any custom `--key-env`) | OS keychain (macOS `security`), `secret-tool`/libsecret (Linux, verified end to end), else a 0600 file under `~/.config/deck/secrets/` | `deck account login <id>` → hidden prompt, or `--from-env VAR`, `--from-file F` (deleted after), or a pipe |
 | `none` (Ollama, LM Studio, any `--base-url`) | nobody | `deck account check <id>` pings it and lists models |
 
 Because each account gets its own config dir, you can hold several Claude / Codex / Cursor logins on one
@@ -115,10 +115,15 @@ subscriptions, `$ in window` for API accounts, tokens for local models.
 
 ## Costs and headroom
 
-- Subscription windows: `--limit 200/5h --limit 1000/1w` (repeatable). The tightest window governs;
-  `deck status` shows used/limit and the reset time. Estimates come from the deck's own ledger — if you
-  also use the account outside the deck, give it a `--usage-cmd` that prints the vendor's numbers and run
-  `deck account sync`.
+- Subscription usage is **read from the vendor CLI's own session logs** where they exist (Claude Code:
+  `<home>/projects/*.jsonl`, one record per turn) — so headroom counts every session on that login,
+  interactive or headless, deduplicated by request id. Validated against a live Max login: 55 requests /
+  1.38M tokens in 5h, matching an independent recount exactly. Vendors without local logs (Cursor) fall
+  back to the deck's ledger; a `--usage-cmd` can supply numbers for anything else.
+- Quotas: `--limit 2000000/5h --limit 10000000/1w` (repeatable; tightest governs) once you know them.
+  Vendors publish subscription quotas loosely, so give the account `--plan max-20x` and the weekly research
+  task fills the limits in from published/observed numbers. Until then `deck status` shows absolute usage
+  ("1.4M tok in 5h (all sessions)") instead of a misleading percentage.
 - API accounts: `--price IN/OUT` in USD per 1M tokens (on the account or the hand) turns parsed tokens
   into `cost_usd`; Claude's own `total_cost_usd` is used when present.
 - `--monthly-usd` on subscriptions shows up as a footer in `deck ledger`, so API spend and fixed

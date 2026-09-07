@@ -56,10 +56,15 @@ A worker that reports an auth failure flips `check.ok` to false (for API keys, t
 fingerprint is remembered until a different key is stored). Hands on such an account show
 `needs-login` (or `down`) and are excluded from routing.
 
-Headroom = tightest of the `limits` windows minus LEDGER usage in that window; an optional `remote`
-reading from `deck account sync` (runs `usage_cmd`, expected to print `{used, limit, window?, reset_at?}`)
-joins the comparison when fresher than an hour. `price` (USD per 1M tokens) computes `cost_usd` for
-runs whose vendor reports tokens but no cost. `monthly_usd` is informational (shown in `deck ledger`).
+Headroom = tightest of the `limits` windows, measured in the account's `metric` (`runs`, `tokens`, `usd`).
+Three sources, most truthful wins: (1) **the vendor CLI's own session logs** on that login — Claude Code
+writes one JSONL record per assistant turn under `<home>/projects/`; deck sums tokens and requests per
+window across *every* session on the login (interactive included), deduplicated by request id — this is the
+default metric (`tokens`) for such vendors; (2) the LEDGER (deck's own runs) for everything else; (3) an
+optional `remote` reading from `deck account sync` via `usage_cmd`. `plan` names the subscription tier so the
+weekly research task can fill `limits` with the vendor's published/observed quota; until then headroom shows
+absolute usage ("1.4M tok in 5h (all sessions)") rather than a percentage. `price` (USD per 1M tokens)
+computes `cost_usd` for runs whose vendor reports tokens but no cost. `monthly_usd` is informational.
 
 **HAND** — `{"id", "vendor", "account", "model", "effort", "cost": "free|low|mid|high", "price", "cmd"}`.
 `cmd` is a shell string. Placeholders: `{prompt}` (shell-quoted), `{context}`, `{handoff}`, `{taskdir}`

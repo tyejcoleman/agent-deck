@@ -172,6 +172,20 @@ deck hand add camel --account pv --cmd 'echo "{\"usage\":{\"inputTokens\":10,\"o
 deck task add "camel" --id t18 >/dev/null; expect 0 deck run t18 --hand camel
 grep -q '"tokens_in": 110, "tokens_out": 5' .deck/ledger.jsonl && pass "cursor camelCase usage parsed" || fail "camelCase usage"
 
+# ---- subscription headroom from the vendor CLI's own session logs (Claude Code JSONL shape) ----
+LH="$HOME/.config/deck/homes/logsacct"; mkdir -p "$LH/projects/-tmp-x"
+NOW=$(date -u +%Y-%m-%dT%H:%M:%S.000Z); OLD=$(date -u -d '-2 days' +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -v-2d +%Y-%m-%dT%H:%M:%S.000Z)
+cat > "$LH/projects/-tmp-x/s1.jsonl" <<EOF
+{"type":"assistant","timestamp":"$NOW","requestId":"r1","message":{"id":"m1","model":"x","usage":{"input_tokens":10,"cache_read_input_tokens":1000,"cache_creation_input_tokens":100,"output_tokens":50}}}
+{"type":"assistant","timestamp":"$NOW","requestId":"r1","message":{"id":"m1","model":"x","usage":{"input_tokens":10,"cache_read_input_tokens":1000,"cache_creation_input_tokens":100,"output_tokens":50}}}
+{"type":"assistant","timestamp":"$OLD","requestId":"r0","message":{"id":"m0","model":"x","usage":{"input_tokens":5000,"output_tokens":5000}}}
+{"type":"user","timestamp":"$NOW","message":{"role":"user","content":"hi"}}
+EOF
+deck account add logsacct --vendor claude --home "$LH" --status-cmd true --limit 2000/5h --limit 20000/1w >/dev/null
+HR=$(deck account ls --json | python3 -c 'import json,sys; a=[x for x in json.load(sys.stdin) if x["id"]=="logsacct"][0]; h=a["headroom"]; w={x["window"]:x for x in h["windows"]}; print(a["metric"], w["5h"]["tokens"], w["5h"]["requests"], w["1w"]["tokens"], h["source"])')
+[ "$HR" = "tokens 1160 1 11160 logs" ] && pass "local session logs: dedup by requestId, per-window tokens/requests" || fail "local logs ($HR)"
+deck account add logsacct --metric runs 2>out.txt >/dev/null; grep -q "old metric" out.txt && pass "warns when metric changes under existing limits" || fail "metric warning"
+
 deck event NOTE --msg hi >/dev/null
 [ "$(deck events --type NOTE -n 1 --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["msg"])')" = hi ] && pass "events filter" || fail "events filter"
 
