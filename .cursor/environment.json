@@ -1,0 +1,4 @@
+{
+  "name": "Agent Deck",
+  "install": "sh install.sh"
+}
