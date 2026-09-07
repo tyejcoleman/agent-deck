@@ -32,20 +32,23 @@ USAGE = os.environ.get("DECK_USAGE_DIR", "~/.config/deck/usage")  # readings fro
 # none (local servers; `base_url` + `health`). cmd/flag/cost seed hands; edit hands/<id>.json freely.
 VENDORS = {
     "claude": dict(home="CLAUDE_CONFIG_DIR", default_home="~/.claude", usage_logs="projects", key="ANTHROPIC_API_KEY", login="claude auth login", status="claude auth status",
+                   install="npm i -g @anthropic-ai/claude-code",
                    usage_cache=".claude.json",
                    models_url="https://api.anthropic.com/v1/models", models_hdr={"x-api-key": "{key}", "anthropic-version": "2023-06-01"},
                    logout="claude auth logout", cmd="claude -p --add-dir {taskdir} --permission-mode acceptEdits --allowedTools Bash --output-format json{model} {prompt}",
                    flag="--model", effort=" --effort {effort}", efforts="low medium high xhigh max", cost="high"),
-    "codex": dict(home="CODEX_HOME", key="OPENAI_API_KEY", login="codex login", headless="codex login --device-auth",
+    "codex": dict(home="CODEX_HOME", default_home="~/.codex", key="OPENAI_API_KEY", login="codex login", headless="codex login --device-auth", install="npm i -g @openai/codex",
                   models_url="https://api.openai.com/v1/models", models_hdr={"Authorization": "Bearer {key}"},
                   status="codex login status", logout="codex logout",
                   cmd="codex exec --sandbox workspace-write --add-dir {taskdir} --skip-git-repo-check --json{model} {prompt}", flag="-m",
                   effort=" -c model_reasoning_effort={effort}", efforts="minimal low medium high xhigh", cost="mid"),
     "cursor": dict(home="CURSOR_CONFIG_DIR", key="CURSOR_API_KEY", login="cursor-agent login", headless_env={"NO_OPEN_BROWSER": "1"}, models_cmd="cursor-agent models",
+                   billing_hint="Cursor exposes no utilization surface; it meters usage at API rates against your plan's included allowance. Track it: --metric usd --limit 20/30d (Pro) and give models prices (deck models refresh --run does).",
+                   install="curl https://cursor.com/install -fsS | bash   (installs cursor-agent; the `cursor` editor binary is not it)",
                    status="cursor-agent status", logout="cursor-agent logout",
                    cmd="cursor-agent -p --force --add-dir {taskdir} --output-format json{model} {prompt}", flag="--model",
                    effort_in_model=True, efforts="low medium high xhigh max", cost="mid"),
-    "gemini": dict(home="GEMINI_CLI_HOME", key="GEMINI_API_KEY", login="gemini", headless_env={"NO_BROWSER": "true"},
+    "gemini": dict(home="GEMINI_CLI_HOME", key="GEMINI_API_KEY", login="gemini", headless_env={"NO_BROWSER": "true"}, install="npm i -g @google/gemini-cli",
                    models_url="https://generativelanguage.googleapis.com/v1beta/models?key={key}",
                    status="file:.gemini/oauth_creds.json", login_hint="pick 'Login with Google', finish in the browser, then /quit",
                    cmd="gemini -p {prompt} --include-directories {taskdir} --approval-mode yolo --output-format json{model}", flag="-m", cost="low"),
@@ -79,6 +82,8 @@ Bring `{path}` up to date with factual notes on the models this deck's hands can
 Write entries with the CLI, do not hand-edit the file:
   deck models set <model-id> vendor=<vendor> good_for=<tag,tag> cost=<free|low|mid|high> efforts=<level,level|-> context=<tokens> notes="<one line>"
 Tags (add others sparingly): reasoning, speed, cheap, long-context, refactor, frontend, tests, research, agentic, vision.
+Add price=IN/OUT (USD per 1M tokens) for every model billed by usage - including models a subscription meters at API list
+rates against an included allowance (e.g. Cursor's non-Cursor models). Models a plan covers without metering: price=0 + a note.
 Remove stale entries: deck models rm <model-id>
 
 ## How
@@ -198,6 +203,26 @@ def read_text_arg(a):
     return Path(f).read_text(encoding="utf-8") if f else None
 
 
+def parse_reset(text):
+    """Vendor limit messages carry a reset hint: an epoch after '|' (Claude Code), 'try again at 7:58 PM' (local clock),
+    or 'resets in 2 hours 10 minutes'. Returns an ISO UTC time or None."""
+    m = re.search(r"limit reached\|(\d{10})", text)
+    if m:
+        return _epoch_iso(m.group(1))
+    m = re.search(r"(?i)(?:try again|resets?|available)(?: again)?(?: at)?\s+(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\b", text)
+    if m:
+        h, mi = int(m.group(1)) % 12 + (12 if m.group(3).lower() == "p" else 0), int(m.group(2) or 0)
+        local = dt.datetime.now().astimezone()
+        cand = local.replace(hour=h, minute=mi, second=0, microsecond=0)
+        if cand <= local:
+            cand += dt.timedelta(days=1)
+        return iso(cand.astimezone(dt.timezone.utc))
+    m = re.search(r"(?i)(?:try again|resets?|available)(?: again)? in\s+(?:(\d+)\s*h(?:ours?)?)?\s*(?:(\d+)\s*m(?:in(?:ute)?s?)?)?", text)
+    if m and (m.group(1) or m.group(2)):
+        return iso(now() + dt.timedelta(hours=int(m.group(1) or 0), minutes=int(m.group(2) or 0)))
+    return None
+
+
 def parse_status(text):
     m = re.search(r"(?i)status[^A-Za-z]*(END|BLOCKED|FAILED)\b", text or "")
     return m.group(1).upper() if m else "END"
@@ -313,7 +338,7 @@ def acct_env(acct):
 def check_account(deck, acct, quiet=True):
     """Refresh acct['check'] = {ok, at, msg} without exposing secrets. Emits AUTH only when the state flips."""
     v, env, auth = VENDORS.get(acct.get("vendor"), {}), dict(os.environ, **acct_env(acct)), acct.get("auth", "none")
-    ok, msg, models, prevc = True, "ok", None, acct.get("check") or {}
+    ok, msg, models, prevc, missing = True, "ok", None, acct.get("check") or {}, False
     if auth == "apikey":
         secret = secret_get(acct["id"])
         ok, msg = bool(secret), "key in %s" % secret_backend() if secret else "no key stored"
@@ -321,12 +346,16 @@ def check_account(deck, acct, quiet=True):
             ok, msg = False, "key rejected by the vendor; store a new one"
     elif auth == "oauth":
         st = acct.get("status_cmd") or v.get("status")
-        if not st:
+        binary = (v.get("cmd") or "").split(" ")[0]
+        if binary and not shutil.which(binary):
+            ok, msg, missing = False, "%s is not installed: %s" % (binary, v.get("install") or "install the vendor CLI"), True
+            st = None
+        if not st and ok:
             msg = "unknown (no status command; set status_cmd)"
-        elif st.startswith("file:"):
+        elif st and st.startswith("file:"):
             ok = (Path(env.get(v.get("home") or "", os.path.expanduser("~"))) / st[5:]).exists()
             msg = "logged in" if ok else "not logged in"
-        else:
+        elif st:
             try:
                 r = subprocess.run(st, shell=True, env=env, capture_output=True, text=True, timeout=60)
                 ok = r.returncode == 0 and not re.search(LOGGED_OUT_RE, r.stdout + r.stderr)
@@ -343,12 +372,14 @@ def check_account(deck, acct, quiet=True):
             ok, msg = False, "down (%s)" % e
     prev = prevc.get("ok")
     acct["check"] = {"ok": ok, "at": iso(now()), "msg": msg}
+    if missing:
+        acct["check"]["missing_cli"] = True
     if not ok and prevc.get("rejected"):
         acct["check"]["rejected"] = prevc["rejected"]
     if models is not None:
         acct["models"] = models
     deck.save(acct, "accounts", acct["id"] + ".json")
-    fix = "" if ok else ("run: deck account login %s" % acct["id"] if auth != "none" else "start the server at %s" % acct.get("base_url"))
+    fix = "" if ok else (v.get("install", "install the vendor CLI") if missing else "run: deck account login %s" % acct["id"] if auth != "none" else "start the server at %s" % acct.get("base_url"))
     if prev != ok and (prev is not None or not ok):  # flips, and a first check that already fails
         emit(deck, "AUTH", account=acct["id"], ok=ok, msg=msg if ok else "%s; %s" % (msg, fix))
     if not quiet:
@@ -416,9 +447,10 @@ def model_state(deck_models, model):
 
 def auth_state(acct):
     """None when usable, else 'needs-login' (oauth/apikey) or 'down' (local server)."""
-    if (acct.get("check") or {}).get("ok") is not False:
+    c = acct.get("check") or {}
+    if c.get("ok") is not False:
         return None
-    return "needs-login" if acct.get("auth", "none") != "none" else "down"
+    return "no-cli" if c.get("missing_cli") else "needs-login" if acct.get("auth", "none") != "none" else "down"
 
 
 def _default_login_exists(v, probe):
@@ -698,13 +730,21 @@ def roster(deck):
     for a in accts.values():
         refresh_remote(deck, a)
     hr = {aid: headroom(a, ledger) for aid, a in accts.items()}
-    last = {r.get("hand"): r["ts"] for r in ledger}
+    last, spend = {r.get("hand"): r["ts"] for r in ledger}, {}
+    for r in ledger:
+        if (now() - ts(r["ts"])).total_seconds() < 7 * 86400 and r.get("hand"):
+            sp = spend.setdefault(r["hand"], [0, 0.0, 0])
+            sp[0] += 1
+            sp[1] += r.get("cost_usd") or 0
+            sp[2] += (r.get("tokens_in") or 0) + (r.get("tokens_out") or 0)
     res = []
     for h in deck.items("hands"):
         c, a = claim_of(deck, h["id"]), hr.get(h.get("account"))
         bad = auth_state(accts.get(h.get("account")) or {}) or model_state(catalog, h.get("model"))
         state = "claimed" if c else "no-account" if not a else bad if bad else "free" if a["state"] == "ok" else a["state"]
-        res.append(dict(h, state=state, claim=c, headroom=a, last_used=last.get(h["id"])))
+        sp = spend.get(h["id"])
+        res.append(dict(h, state=state, claim=c, headroom=a, last_used=last.get(h["id"]),
+                        observed={"runs_7d": sp[0], "avg_usd": round(sp[1] / sp[0], 3), "avg_tokens": int(sp[2] / sp[0])} if sp else None))
     return res
 
 
@@ -906,6 +946,8 @@ def account_add(deck, a):
             hint += "\nnote: this machine already has a %s login in the default dir; to reuse it: deck account add %s --home default" % (rec["vendor"], a.id)
     if ok and rec["auth"] == "oauth" and v.get("usage_cache") and not tap_windows(rec):
         hint += "\nlive subscription usage: deck account tap %s   (statusline tap; official surface, no network)" % a.id
+    if v.get("billing_hint") and not rec.get("limits"):
+        hint += "\n" + v["billing_hint"]
     out(a, rec, "account %s saved (%s, auth=%s, limits=%s): %s%s" % (a.id, rec["vendor"], rec["auth"], rec.get("limits") or "none", rec["check"]["msg"], hint))
 
 
@@ -1064,11 +1106,14 @@ def cmd_status(deck, a):
         note = ("by %s on %s" % (c["by"], c.get("task", "?")) if c else
                 "run: deck account login %s" % h.get("account") if h["state"] == "needs-login" else
                 "server down (deck account check %s)" % h.get("account") if h["state"] == "down" else
+                "CLI not installed (deck account check %s)" % h.get("account") if h["state"] == "no-cli" else
                 "model unavailable: deck models probe %s --hand %s" % (h.get("model"), h["id"]) if h["state"] == "no-model" else
                 "until %s" % hr["cooldown_until"] if h["state"] == "cooldown" else
                 "resets in %s" % fdur((ts(hr["reset_at"]) - now()).total_seconds()) if hr.get("reset_at") else "")
-        rows.append([h["id"], h.get("model") or "-", h.get("account", ""), h.get("cost", ""), h["state"], head_text(hr, accts.get(h.get("account"))), note])
-    print(table(["HAND", "MODEL", "ACCOUNT", "COST", "STATE", "HEADROOM", "NOTE"], rows) if rows else "no hands (deck hand add ...)")
+        ob = h.get("observed")
+        rows.append([h["id"], h.get("model") or "-", h.get("account", ""), h.get("cost", ""), "$%.2f/%dk" % (ob["avg_usd"], ob["avg_tokens"] / 1000) if ob else "-",
+                     h["state"], head_text(hr, accts.get(h.get("account"))), note])
+    print(table(["HAND", "MODEL", "ACCOUNT", "COST", "OBSERVED", "STATE", "HEADROOM", "NOTE"], rows) if rows else "no hands (deck hand add ...)")
     print("tasks: " + (", ".join("%s %d" % kv for kv in sorted(counts.items())) or "none"))
     upd = deck.models().get("updated")
     if ro and (not upd or (now() - ts(upd)).total_seconds() > 7 * 86400):
@@ -1077,7 +1122,8 @@ def cmd_status(deck, a):
 
 def why_no_hand(deck):
     """One line per unusable hand with its fix, so an agent can act instead of guessing."""
-    fixes = {"needs-login": "deck account login %(account)s", "down": "deck account check %(account)s", "no-model": "model %(model)s unavailable: deck models probe %(model)s --hand %(id)s",
+    fixes = {"needs-login": "deck account login %(account)s", "down": "deck account check %(account)s", "no-cli": "vendor CLI not installed: deck account check %(account)s",
+             "no-model": "model %(model)s unavailable: deck models probe %(model)s --hand %(id)s",
              "claimed": "held by %(by)s until %(until)s", "cooldown": "until %(cooldown_until)s", "exhausted": "resets %(reset_at)s",
              "no-account": "deck account add %(account)s"}
     lines = []
@@ -1234,7 +1280,7 @@ def cmd_run(deck, a):
     secs = round(time.time() - t0)
     (tdir / "runs").mkdir(exist_ok=True)
     (tdir / "runs" / ("%d.log" % n)).write_text(output, encoding="utf-8")
-    usage, price = parse_usage(output), hand.get("price") or acct.get("price")
+    usage, price = parse_usage(output), hand.get("price") or acct.get("price") or (deck.models().get("models", {}).get(model or "") or {}).get("price")
     if price and not usage.get("cost_usd") and (usage.get("tokens_in") or usage.get("tokens_out")):
         usage["cost_usd"] = round((usage.get("tokens_in", 0) * price.get("in", 0) + usage.get("tokens_out", 0) * price.get("out", 0)) / 1e6, 6)
     wrote = hf.exists() and hf.stat().st_mtime > before
@@ -1257,9 +1303,9 @@ def cmd_run(deck, a):
         emit(deck, "AUTH", account=acct["id"], ok=False, by=by, msg=msg)
     elif re.search(RATE_LIMIT_RE, output):
         status, msg = "BLOCKED", "rate limited on account %s" % acct["id"]
-        m = re.search(r"limit reached\|(\d{10})", output)  # Claude Code appends the reset epoch to its limit message
+        hinted = parse_reset(output)  # the vendor usually says when
         resets = [w.get("reset_at") for w in (acct.get("remote") or {}).get("windows", {}).values() if w.get("reset_at")]
-        acct["cooldown_until"] = (_epoch_iso(m.group(1)) if m else min(r for r in resets if ts(r) > now()) if any(ts(r) > now() for r in resets)
+        acct["cooldown_until"] = (hinted if hinted and ts(hinted) > now() else min(r for r in resets if ts(r) > now()) if any(ts(r) > now() for r in resets)
                                   else iso(now() + dt.timedelta(seconds=dur(acct.get("cooldown") or ("5m" if acct.get("auth") == "apikey" else "1h")))))
         msg += "; usable again %s" % acct["cooldown_until"]
         deck.save(acct, "accounts", acct["id"] + ".json")
@@ -1326,6 +1372,8 @@ def cmd_models(deck, a):
             k, _, v = kv.partition("=")
             if k in ("good_for", "efforts"):
                 rec[k] = [x.strip() for x in v.split(",") if x.strip() and x.strip() != "-"]
+            elif k == "price":
+                rec[k] = parse_price(v) if v not in ("0", "-", "") else {"in": 0, "out": 0}
             else:
                 try:
                     rec[k] = json.loads(v)  # true/false/numbers become real values
@@ -1370,9 +1418,10 @@ def cmd_models(deck, a):
         return out(a, {x["id"]: x.get("models") for x in deck.items("accounts")},
                    "\n".join("%s (%s): %s" % (x["id"], x.get("models_at", "-"), ", ".join(x.get("models") or ["(cannot enumerate)"])) for x in deck.items("accounts")))
     head = "model notes: %s%s" % ("never refreshed" if age is None else "updated %.1f days ago" % age, "  ->  deck models refresh" if stale else "")
-    out(a, m, head + ("\n" + table(["MODEL", "VENDOR", "AVAIL", "COST", "GOOD FOR", "EFFORTS", "CTX", "NOTES"],
+    out(a, m, head + ("\n" + table(["MODEL", "VENDOR", "AVAIL", "COST", "$/M IN/OUT", "GOOD FOR", "EFFORTS", "CTX", "NOTES"],
                                     [[r.get("id"), r.get("vendor", ""), {True: "yes", False: "NO"}.get(r.get("available"), "?"), r.get("cost", ""),
-                                      ",".join(r.get("good_for", [])), ",".join(r.get("efforts", [])) or "-", r.get("context", ""), (r.get("notes") or "")[:60]] for r in rows]) if rows else ""))
+                                      "%g/%g" % (r["price"].get("in", 0), r["price"].get("out", 0)) if isinstance(r.get("price"), dict) else "-",
+                                      ",".join(r.get("good_for", [])), ",".join(r.get("efforts", [])) or "-", r.get("context", ""), (r.get("notes") or "")[:50]] for r in rows]) if rows else ""))
 
 
 def probe_model(deck, a):

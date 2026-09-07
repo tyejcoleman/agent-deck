@@ -40,11 +40,11 @@ with git, SSH, or Syncthing and every machine sees the same roster.
 cd ~/ops && deck init
 
 # accounts = every login you own. The record is a pointer; tokens stay with the vendor CLI / OS keychain.
-deck account add claude-work --vendor claude --monthly-usd 200 --now
+deck account add claude-work --vendor claude --home default --monthly-usd 200   # reuse this machine's login
 deck account tap claude-work                 # live 5h / 7-day % from Claude Code's own statusline payload
-deck account add codex-team  --vendor codex  --limit 50/5h --now
-deck account add anthropic   --vendor claude --auth apikey --price 3/15 --now     # hidden key prompt
-deck account add ollama      --vendor ollama                                       # local, free
+deck account add codex-team  --vendor codex --home default --limit 50/5h
+deck account add anthropic   --vendor claude --auth apikey --price 3/15   # then, as a human: deck account login anthropic
+deck account add ollama      --vendor ollama                              # local, free
 
 # hands = reusable presets bound to an account. Templates for every vendor above are built in.
 deck hand add claude-fable --account claude-work --model claude-fable-5-1 --cost high
@@ -134,6 +134,9 @@ subscriptions, `$ in window` for API accounts, tokens for local models.
 - `--monthly-usd` on subscriptions shows up as a footer in `deck ledger`, so API spend and fixed
   subscription spend sit side by side.
 - Local models are cost class `free` and rank first when a task asks for `--cost free`.
+- Cost classes are routing *preferences*; the `OBSERVED` column in `deck status` is the truth: average `$/run`
+  and tokens per run over the last 7 days per hand. Expect a Claude Code `-p` run to start around 150k
+  cache-inclusive input tokens (system prompt + tools) even for a one-line edit — "low" on Claude is not low.
 
 ## How the loop works
 

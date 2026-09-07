@@ -77,7 +77,7 @@ deck hand add argv --account other --cost low --cmd 'sh -c "printf %s \"\$1\" | 
 python3 -c "print('x'*300000)" > big.md
 deck task add "big" --id t9 --file big.md >/dev/null
 expect 0 deck run t9 --hand argv
-[ "$(head -1 .deck/tasks/t9/runs/1.log)" = 0 ] && grep -qE '^30[0-9]{4}$' .deck/tasks/t9/runs/1.log && pass "oversize prompt falls back to stdin" || fail "oversize prompt falls back to stdin"
+[ "$(head -1 .deck/tasks/t9/runs/1.log | tr -d ' ')" = 0 ] && tr -d ' ' < .deck/tasks/t9/runs/1.log | grep -qE '^30[0-9]{4}$' && pass "oversize prompt falls back to stdin" || fail "oversize prompt falls back to stdin"
 
 deck task add "badcwd" --id t10 >/dev/null; deck task set t10 cwd=/nonexistent >/dev/null
 expect 1 deck run t10 --hand argv
@@ -214,6 +214,26 @@ deck account sync logsacct >/dev/null
 printf '{"statusLine":{"type":"command","command":"echo mine"}}\n' > "$LH/settings.json"
 deck account tap logsacct >/dev/null && grep -q -- "--chain 'echo mine'" "$LH/settings.json" && deck account tap logsacct --off >/dev/null && [ "$(python3 -c 'import json; print(json.load(open("'"$LH"'/settings.json"))["statusLine"]["command"])')" = "echo mine" ] && pass "account tap wires/chains/restores settings.json" || fail "account tap wiring"
 unset DECK_USAGE_DIR
+
+# missing vendor CLI is its own state (checked with an empty PATH so the host's installs don't matter)
+mkdir -p "$TMP/gemhome"; deck account add gem --vendor gemini --home "$TMP/gemhome" >/dev/null 2>&1
+PATH="$(dirname "$(command -v python3)")" python3 "$HERE/deck" account check gem >out.txt 2>&1 || true
+grep -q "gemini is not installed" out.txt && deck hand add gemh --account gem --cmd true >/dev/null && deck status | grep -q "gemh .*no-cli" && pass "missing vendor CLI -> no-cli with install hint" || fail "no-cli ($(cat out.txt))"
+python3 - "$HERE/deck" <<'EOF2' | grep -q ok && pass "parse_reset understands epoch, clock and duration hints" || fail "parse_reset"
+import sys
+src = open(sys.argv[1]).read().replace('if __name__ == "__main__":', "if False:")
+ns = {}; exec(compile(src, "deck", "exec"), ns); pr = ns["parse_reset"]
+assert pr("You have hit your usage limit. Try again at 7:58 PM") is not None
+assert pr("Claude AI usage limit reached|1900000000") == "2030-03-17T17:46:40Z"
+assert pr("rate limit; resets in 2 hours 10 minutes") is not None
+assert pr("no hint here") is None
+print("ok")
+EOF2
+
+deck hand add priced --account pv --model catalog-priced --cmd 'echo "{\"usage\":{\"inputTokens\":1000000,\"outputTokens\":0}}"' >/dev/null
+deck models set catalog-priced vendor=pvend price=2/10 >/dev/null
+deck task add "priced" --id t19 >/dev/null; expect 0 deck run t19 --hand priced
+grep -q '"cost_usd": 2.0' .deck/ledger.jsonl && pass "catalog model price -> cost_usd when hand/account have none" || fail "catalog price"
 
 deck event NOTE --msg hi >/dev/null
 [ "$(deck events --type NOTE -n 1 --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["msg"])')" = hi ] && pass "events filter" || fail "events filter"
