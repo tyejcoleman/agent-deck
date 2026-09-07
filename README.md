@@ -134,7 +134,7 @@ cursor-agent 2026.09, gemini-cli 0.58). Edit `hands/<id>.json` freely; deck only
 
 | vendor | login isolation | cmd |
 |---|---|---|
-| claude   | `CLAUDE_CONFIG_DIR` | `claude -p --add-dir {taskdir} --permission-mode acceptEdits --output-format json --model M {prompt}` |
+| claude   | `CLAUDE_CONFIG_DIR` | `claude -p --add-dir {taskdir} --permission-mode acceptEdits --allowedTools Bash --output-format json --model M {prompt}` |
 | codex    | `CODEX_HOME` | `codex exec --sandbox workspace-write --add-dir {taskdir} --skip-git-repo-check --json -m M {prompt}` |
 | cursor   | `CURSOR_CONFIG_DIR` | `cursor-agent -p --force --add-dir {taskdir} --output-format json --model M {prompt}` |
 | gemini   | `GEMINI_CLI_HOME` | `gemini -p {prompt} --include-directories {taskdir} --approval-mode yolo --output-format json -m M` |

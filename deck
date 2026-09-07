@@ -31,7 +31,7 @@ SECRETS = "~/.config/deck/secrets"  # 0600 files, used only when no keychain/lib
 # none (local servers; `base_url` + `health`). cmd/flag/cost seed hands; edit hands/<id>.json freely.
 VENDORS = {
     "claude": dict(home="CLAUDE_CONFIG_DIR", key="ANTHROPIC_API_KEY", login="claude auth login", status="claude auth status",
-                   logout="claude auth logout", cmd="claude -p --add-dir {taskdir} --permission-mode acceptEdits --output-format json{model} {prompt}",
+                   logout="claude auth logout", cmd="claude -p --add-dir {taskdir} --permission-mode acceptEdits --allowedTools Bash --output-format json{model} {prompt}",
                    flag="--model", cost="high"),
     "codex": dict(home="CODEX_HOME", key="OPENAI_API_KEY", login="codex login", headless="codex login --device-auth",
                   status="codex login status", logout="codex logout",
@@ -89,6 +89,9 @@ ACCOUNTS (agents set them up; only humans log in):
   deck account check [id]        refresh auth state without touching secrets
   On an AUTH event (or a hand in needs-login): tell the human exactly this, nothing else:
       deck account login <id>            (add --headless on a VPS: prints a URL + one-time code)
+  If you drive the terminal (tmux): run it with --headless yourself, relay the URL/code to the human, paste
+  back the code they give you. Meanwhile: deck events -f --type AUTH   (wakes you when it flips to ok)
+  Machine already logged in to the vendor? deck account add <id> --home default reuses that login.
   Never ask for a key in chat. Never read ~/.config/deck. Tokens stay in the vendor's dir or the OS keychain.
 
 WORKER (Claude Code, Codex, Cursor, Gemini) started by `deck run`:
@@ -182,7 +185,7 @@ def parse_usage(output):
     u = {"tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0}
     for o in scan_json(output):
         us = o.get("usage") if isinstance(o.get("usage"), dict) else {}
-        u["tokens_in"] += int(us.get("input_tokens") or 0)
+        u["tokens_in"] += int(us.get("input_tokens") or 0) + int(us.get("cache_read_input_tokens") or 0) + int(us.get("cache_creation_input_tokens") or 0)
         u["tokens_out"] += int(us.get("output_tokens") or 0)
         u["cost_usd"] += float(o.get("total_cost_usd") or 0)
         for m in (((o.get("stats") or {}).get("models") or {}) if isinstance(o.get("stats"), dict) else {}).values():
@@ -318,6 +321,17 @@ def auth_state(acct):
     if (acct.get("check") or {}).get("ok") is not False:
         return None
     return "needs-login" if acct.get("auth", "none") != "none" else "down"
+
+
+def _default_login_exists(v, probe):
+    st = v.get("status")
+    try:
+        if st.startswith("file:"):
+            return (Path(os.path.expanduser("~")) / st[5:]).exists()
+        r = subprocess.run(st, shell=True, env=dict(os.environ, **acct_env(probe)), capture_output=True, text=True, timeout=30)
+        return r.returncode == 0 and not re.search(LOGGED_OUT_RE, r.stdout + r.stderr)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def auth_ok(deck, acct, max_age=3600):
@@ -503,7 +517,11 @@ def cmd_init(a):
     for f in ("events.jsonl", "ledger.jsonl"):
         (root / f).touch()
     (root / "AGENTS.md").write_text(AGENTS_MD, encoding="utf-8")
-    out(a, {"deck": str(root)}, "deck ready: %s\nnext: deck account add <id> --vendor claude|codex|cursor|gemini|ollama --now\n      deck hand add <id> --account <id> [--model M]" % root)
+    out(a, {"deck": str(root)}, "deck ready: %s\n"
+        "read:  %s/AGENTS.md\n"
+        "next:  deck account add <id> --vendor claude|codex|cursor|gemini|ollama|lmstudio   (an agent can do this)\n"
+        "       deck account login <id> [--headless]                                       (a human does this)\n"
+        "       deck hand add <id> --account <id> [--model M]" % (root, root))
 
 
 def parse_price(s):  # "3/15" -> USD per million tokens in/out
@@ -551,6 +569,10 @@ def account_add(deck, a):
     ok = check_account(deck, rec)
     hint = "" if ok else ("\nnext: deck account login %s%s" % (a.id, "   (add --headless on a box without a browser)" if rec["auth"] == "oauth" else "")
                           if rec["auth"] != "none" else "\nserver not reachable at %s" % rec.get("base_url"))
+    if not ok and rec["auth"] == "oauth" and v.get("home") and v.get("status") and rec.get("env", {}).get(v["home"]):
+        probe = dict(rec, env={k: x for k, x in rec["env"].items() if k != v["home"]})  # the vendor's default dir
+        if _default_login_exists(v, probe):
+            hint += "\nnote: this machine already has a %s login in the default dir; to reuse it: deck account add %s --home default" % (rec["vendor"], a.id)
     out(a, rec, "account %s saved (%s, auth=%s, limits=%s): %s%s" % (a.id, rec["vendor"], rec["auth"], rec.get("limits") or "none", rec["check"]["msg"], hint))
 
 
@@ -580,8 +602,9 @@ def account_login(deck, acct, a):
             "no login command for vendor %r; log in with the vendor's own tool using env %s, then `deck account check %s`" % (acct["vendor"], acct.get("env"), acct["id"]))
         if a.headless:
             env.update(v.get("headless_env", {}))
-        print("Logging in account %s via `%s`. Tokens are kept by the vendor CLI under %s - never in the deck.%s" % (
-            acct["id"], cmd, env.get(v.get("home") or "", "its default dir"), "\n(%s)" % v["login_hint"] if v.get("login_hint") else ""), flush=True)
+        print("Logging in account %s via `%s`. Tokens are kept by the vendor CLI under %s - never in the deck.%s%s" % (
+            acct["id"], cmd, env.get(v.get("home") or "", "its default dir"), "\n(%s)" % v["login_hint"] if v.get("login_hint") else "",
+            "\nAGENT: relay the URL / one-time code below to the human; if the vendor then asks for a code, paste the one the human gives you here." if a.headless else ""), flush=True)
         subprocess.call(cmd, shell=True, env=env)  # interactive: browser or device-code flow, the human finishes it
     else:
         die("account %s (auth=none) needs no login; try `deck account check %s`" % (acct["id"], acct["id"]))
@@ -650,6 +673,8 @@ def cmd_hand(deck, a):
         for k in ("model", "cost", "cmd", "notes"):
             if getattr(a, k):
                 rec[k] = getattr(a, k)
+        if rec.get("cmd") == "default":
+            rec.pop("cmd")
         if "cmd" not in rec:
             if rec["vendor"] not in VENDORS:
                 die("--cmd required for vendor %r (built-in templates: %s)" % (rec["vendor"], ", ".join(VENDORS)))
@@ -689,11 +714,23 @@ def cmd_status(deck, a):
     print("tasks: " + (", ".join("%s %d" % kv for kv in sorted(counts.items())) or "none"))
 
 
+def why_no_hand(deck):
+    """One line per unusable hand with its fix, so an agent can act instead of guessing."""
+    fixes = {"needs-login": "deck account login %(account)s", "down": "deck account check %(account)s",
+             "claimed": "held by %(by)s until %(until)s", "cooldown": "until %(cooldown_until)s", "exhausted": "resets %(reset_at)s",
+             "no-account": "deck account add %(account)s"}
+    lines = []
+    for h in roster(deck):
+        info = dict(h, **(h.get("claim") or {}), **(h.get("headroom") or {}))
+        lines.append("%s: %s (%s)" % (h["id"], h["state"], fixes.get(h["state"], "") % info))
+    return "no free hand" + ("; " + "; ".join(lines) if lines else " (deck hand add ...)")
+
+
 def cmd_route(deck, a):
     ranked = route(deck, a.cost, a.vendor)
     out(a, ranked, table(["#", "HAND", "COST", "HEADROOM", "LAST USED"],
                          [[i + 1, h["id"], h.get("cost", ""), "%d%%" % round(h["headroom"]["frac"] * 100), h.get("last_used") or "never"]
-                          for i, h in enumerate(ranked)]) if ranked else "no free hand")
+                          for i, h in enumerate(ranked)]) if ranked else why_no_hand(deck))
     return 0 if ranked else 2
 
 
@@ -748,7 +785,7 @@ def cmd_run(deck, a):
     ranked = [deck.load("hands", a.hand + ".json")] if a.hand else route(deck, a.cost or task.get("cost"), a.vendor)
     if a.dry:
         if not ranked:
-            out(a, {"status": "BLOCKED", "msg": "no free hand"}, "no free hand")
+            out(a, {"status": "BLOCKED", "msg": why_no_hand(deck)}, why_no_hand(deck))
             return 2
         hand = ranked[0]
     else:
@@ -768,8 +805,7 @@ def cmd_run(deck, a):
                     raise
                 print(str(e), file=sys.stderr)
         if not hand:
-            resets = [h["headroom"].get("cooldown_until") or h["headroom"].get("reset_at") for h in roster(deck) if h["headroom"]]
-            msg = "no free hand" + ("; earliest reset %s" % min(r for r in resets if r) if any(resets) else "")
+            msg = why_no_hand(deck)
             task.pop("hand", None)
             finish(deck, task, "BLOCKED", by, msg=msg)
             out(a, {"status": "BLOCKED", "msg": msg}, "BLOCKED: " + msg)
@@ -1030,7 +1066,7 @@ def build_parser():
     s = group("hand", "hands: add | ls | rm")
     q = sp("add", cmd_hand, "add or update a hand preset", s)
     q.add_argument("id"), q.add_argument("--account"), q.add_argument("--vendor"), q.add_argument("--model"), q.add_argument("--cost", choices=COSTS)
-    q.add_argument("--cmd", help="shell command; placeholders {prompt} {context} {handoff} {taskdir} {task}"), q.add_argument("--price", help="USD per 1M tokens IN/OUT, e.g. 3/15"), q.add_argument("--notes")
+    q.add_argument("--cmd", help="shell command; placeholders {prompt} {context} {handoff} {taskdir} {task}; 'default' regenerates from the vendor template"), q.add_argument("--price", help="USD per 1M tokens IN/OUT, e.g. 3/15"), q.add_argument("--notes")
     sp("ls", cmd_hand, "list hands", s)
     sp("rm", cmd_hand, "remove a hand", s).add_argument("id")
 

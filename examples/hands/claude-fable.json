@@ -4,6 +4,6 @@
   "account": "claude-main",
   "model": "claude-fable-5-1",
   "cost": "high",
-  "cmd": "claude -p --add-dir {taskdir} --permission-mode acceptEdits --output-format json --model claude-fable-5-1 {prompt}",
+  "cmd": "claude -p --add-dir {taskdir} --permission-mode acceptEdits --allowedTools Bash --output-format json --model claude-fable-5-1 {prompt}",
   "notes": "Deep work. --output-format json lets deck parse input_tokens/output_tokens/total_cost_usd into the ledger."
 }
